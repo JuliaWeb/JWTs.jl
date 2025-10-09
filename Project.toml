@@ -3,7 +3,7 @@ uuid = "d850fbd6-035d-5a70-a269-1ca2e636ac6c"
 keywords = ["julialang", "jwt", "jwt-authentication", "jwkset", "signing"]
 license = "MIT"
 desc = "JSON Web Tokens (JWT) for Julia"
-authors = ["Tanmay Mohapatra <tanmaykm@gmail.com>"]
+authors = ["Tanmay Mohapatra <tanmaykm@gmail.com>", "contributors: https://github.com/JuliaWeb/JWTs.jl/graphs/contributors"]
 version = "0.3.1"
 
 [deps]

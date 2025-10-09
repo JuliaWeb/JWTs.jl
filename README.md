@@ -1,7 +1,7 @@
 # JWTs
 
-[![Build Status](https://github.com/tanmaykm/JWTs.jl/workflows/CI/badge.svg)](https://github.com/tanmaykm/JWTs.jl/actions?query=workflow%3ACI+branch%3Amaster)
-[![codecov](https://codecov.io/gh/tanmaykm/JWTs.jl/branch/master/graph/badge.svg?token=VK7JZ2hMQx)](https://codecov.io/gh/tanmaykm/JWTs.jl)
+[![Build Status](https://github.com/JuliaWeb/JWTs.jl/workflows/CI/badge.svg)](https://github.com/JuliaWeb/JWTs.jl/actions?query=workflow%3ACI+branch%3Amaster)
+[![codecov](https://codecov.io/gh/JuliaWeb/JWTs.jl/branch/master/graph/badge.svg?token=VK7JZ2hMQx)](https://codecov.io/gh/JuliaWeb/JWTs.jl)
 
 JSON Web Tokens (JWT) are an open, industry standard [RFC 7519](https://tools.ietf.org/html/rfc7519) method for representing and transferring claims securely between two parties.
 
