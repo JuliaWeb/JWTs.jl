@@ -4,7 +4,7 @@ keywords = ["julialang", "jwt", "jwt-authentication", "jwkset", "signing"]
 license = "MIT"
 desc = "JSON Web Tokens (JWT) for Julia"
 authors = ["Tanmay Mohapatra <tanmaykm@gmail.com>", "contributors: https://github.com/JuliaWeb/JWTs.jl/graphs/contributors"]
-version = "0.3.0"
+version = "0.3.1"
 
 [deps]
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
@@ -15,7 +15,7 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 
 [compat]
 Downloads = "1"
-JSON = "0.20, 0.21"
+JSON = "0.20, 0.21, 1"
 MbedTLS = "0.6.8, 0.7, 1"
 julia = "1.3"
 

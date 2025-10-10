@@ -68,7 +68,7 @@ mutable struct JWT
     verified::Bool
     valid::Union{Nothing,Bool}
 
-    function JWT(; jwt::Union{Nothing,String}=nothing, payload::Union{Nothing,Dict{String,Any},String}=nothing)
+    function JWT(; jwt::Union{Nothing,String}=nothing, payload=nothing)
         if jwt !== nothing
             (payload === nothing) || throw(ArgumentError("payload must be nothing if jwt is provided"))
             parts = split(jwt, ".")
