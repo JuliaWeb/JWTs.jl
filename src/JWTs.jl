@@ -228,7 +228,7 @@ function sign!(jwt::JWT, key::JWK, kid::String="")
     header = urlenc(base64encode(JSON.json(header_dict)))
 
     data = header * "." * jwt.payload
-    sigbytes = key isa JWKRSA ?  MbedTLS.sign(key.key, key.kind, MbedTLS.digest(key.kind, data), MersenneTwister(0)) : MbedTLS.digest(key.kind, data, key.key)
+    sigbytes = key isa JWKRSA ?  MbedTLS.sign(key.key, key.kind, MbedTLS.digest(key.kind, data), MersenneTwister()) : MbedTLS.digest(key.kind, data, key.key)
     signature = urlenc(base64encode(sigbytes))
 
     jwt.header = header
