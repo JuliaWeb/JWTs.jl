@@ -276,7 +276,15 @@ function refresh!(keyseturl::String, keysetdict::Dict{String,JWK}; default_algs 
         jstr = readchomp(keyseturl[8:end])
     else
         output = PipeBuffer()
-        Downloads.request(keyseturl; method="GET", output=output, downloader=downloader)
+        response = Downloads.request(keyseturl; method="GET", output=output, downloader=downloader)
+
+        # check that we got a valid response. This will avoid giving an "invalid JSON" message if the
+        # response is e.g. "Not found". Note that Downloads.request follows redrects (tested), so if
+        # the actual response is, say, a 301, we will get the 200 from the redirected page.
+        if response.status != 200
+            throw(Downloads.RequestError(keyseturl, response.status, response.message, response))
+        end
+
         jstr = String(take!(output))
     end
     keys = JSON.parse(jstr)["keys"]
