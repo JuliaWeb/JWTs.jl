@@ -1,7 +1,6 @@
 using JWTs
 using Test
 using JSON
-using MbedTLS
 using Base64
 
 const test_payload_data = [
@@ -150,7 +149,7 @@ function test_signing_asymmetric_keys(keyset_url, algorithms::Vector{String})
         if startswith(keyfile, "file://")
             keyfile = keyfile[8:end]
         end
-        signingkeyset.keys[k] = JWKRSA(signingkeyset.keys[k].kind, MbedTLS.parse_keyfile(keyfile))
+        signingkeyset.keys[k] = JWKRSA(JWTs.alg(signingkeyset.keys[k]), JWTs.parse_keyfile(keyfile))
     end
     test_signing_keys(keyset, signingkeyset, algorithms)
 end
@@ -239,18 +238,16 @@ end
     end
 
     @testset "alg" begin
-        rsakey = MbedTLS.parse_keyfile(joinpath(@__DIR__, "keys", "rsa", "rsakey1.private.pem"))
-        @test JWTs.alg(JWKRSA(MbedTLS.MD_SHA256, rsakey)) == "RS256"
-        @test JWTs.alg(JWKRSA(MbedTLS.MD_SHA384, rsakey)) == "RS384"
-        @test JWTs.alg(JWKRSA(MbedTLS.MD_SHA, rsakey)) == "RS512"
+        rsakey = JWTs.parse_keyfile(joinpath(@__DIR__, "keys", "rsa", "rsakey1.private.pem"))
+        @test JWTs.alg(JWKRSA("RS256", rsakey)) == "RS256"
+        @test JWTs.alg(JWKRSA("RS384", rsakey)) == "RS384"
+        @test JWTs.alg(JWKRSA("RS512", rsakey)) == "RS512"
 
-        @test JWTs.alg(JWKSymmetric(MbedTLS.MD_SHA256, UInt8[])) == "HS256"
-        @test JWTs.alg(JWKSymmetric(MbedTLS.MD_SHA384, UInt8[])) == "HS384"
-        @test JWTs.alg(JWKSymmetric(MbedTLS.MD_SHA, UInt8[])) == "HS512"
+        @test JWTs.alg(JWKSymmetric("HS256", UInt8[])) == "HS256"
+        @test JWTs.alg(JWKSymmetric("HS384", UInt8[])) == "HS384"
+        @test JWTs.alg(JWKSymmetric("HS512", UInt8[])) == "HS512"
 
-        for kind in (MbedTLS.MD_SHA1, MbedTLS.MD_SHA224)
-            @test_throws ArgumentError JWTs.alg(JWKRSA(kind, rsakey))
-            @test_throws ArgumentError JWTs.alg(JWKSymmetric(kind, UInt8[]))
-        end
+        @test_throws ArgumentError JWKRSA("RS1024", rsakey)
+        @test_throws ArgumentError JWKSymmetric("HS1024", UInt8[])
     end
 end

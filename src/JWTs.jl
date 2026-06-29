@@ -1,10 +1,12 @@
 module JWTs
 
-using MbedTLS
 using JSON
 using Base64
 using Downloads
-using Random
+using OpenSSL_jll
+using SHA
+
+include("crypto.jl")
 
 import Base: getproperty, setproperty!, show, isvalid
 export JWT, JWK, JWKRSA, JWKSymmetric, JWKSet
@@ -14,13 +16,23 @@ export show, claims, kid
 export with_valid_jwt
 
 struct JWKSymmetric
-    kind::MbedTLS.MDKind
+    alg::String
     key::Vector{UInt8}
+
+    function JWKSymmetric(alg::AbstractString, key::AbstractVector{UInt8})
+        alg in HMAC_ALGORITHMS || throw(ArgumentError("unsupported symmetric key algorithm: $alg"))
+        new(String(alg), Vector{UInt8}(key))
+    end
 end
 
 struct JWKRSA
-    kind::MbedTLS.MDKind
-    key::Union{RSA,MbedTLS.PKContext}
+    alg::String
+    key::OpenSSLKey
+
+    function JWKRSA(alg::AbstractString, key::OpenSSLKey)
+        alg in RSA_ALGORITHMS || throw(ArgumentError("unsupported RSA key algorithm: $alg"))
+        new(String(alg), key)
+    end
 end
 
 """
@@ -182,11 +194,7 @@ Supported algorithms are "RS256", "RS384", "RS512", "HS256", "HS384", and "HS512
 An `ArgumentError` is thrown for unsupported algorithms.
 """
 function alg(key::JWK)
-    kind = key.kind
-    if !(kind === MbedTLS.MD_SHA256 || kind === MbedTLS.MD_SHA384 || kind === MbedTLS.MD_SHA)
-        throw(ArgumentError("unsupported key algorithm: $(kind)"))
-    end
-    return string(key isa JWKRSA ? "RS" : "HS", MbedTLS.get_size(kind) << 3)
+    return key.alg
 end
 
 show(io::IO, jwt::JWT) = print(io, issigned(jwt) ? join([jwt.header, jwt.payload, jwt.signature], '.') : jwt.payload)
@@ -231,12 +239,12 @@ function validate!(jwt::JWT, key::JWK; algorithms::Vector{String}=String[])
     end
     valid = valid_alg && if key isa JWKRSA
         try
-            MbedTLS.verify(key.key, key.kind, MbedTLS.digest(key.kind, data), sigbytes) == 0
+            verify_rsa(key.key, alg(key), data, sigbytes)
         catch
             false
         end
     else
-        MbedTLS.digest(key.kind, data, key.key) == sigbytes
+        constant_time_equal(hmac_digest(alg(key), key.key, data), sigbytes)
     end
     return setvalidation!(jwt, valid)
 end
@@ -279,7 +287,7 @@ function sign!(jwt::JWT, key::JWK, kid::String="")
     header = urlenc(base64encode(JSON.json(header_dict)))
 
     data = header * "." * jwt.payload
-    sigbytes = key isa JWKRSA ?  MbedTLS.sign(key.key, key.kind, MbedTLS.digest(key.kind, data), MersenneTwister()) : MbedTLS.digest(key.kind, data, key.key)
+    sigbytes = key isa JWKRSA ? sign_rsa(key.key, alg(key), data) : hmac_digest(alg(key), key.key, data)
     signature = urlenc(base64encode(sigbytes))
 
     setparts!(jwt, JWTParts(jwt.payload, header, signature); verified=true, valid=true)
@@ -343,11 +351,11 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                 n = base64decode(urldec(key["n"]))
                 e = base64decode(urldec(key["e"]))
                 if alg == "RS256"
-                    keysetdict[kid] = JWKRSA(MbedTLS.MD_SHA256, pubkey(n, e, MbedTLS.MD_SHA256))
+                    keysetdict[kid] = JWKRSA(alg, rsa_public_key(n, e))
                 elseif alg == "RS384"
-                    keysetdict[kid] = JWKRSA(MbedTLS.MD_SHA384, pubkey(n, e, MbedTLS.MD_SHA384))
+                    keysetdict[kid] = JWKRSA(alg, rsa_public_key(n, e))
                 elseif alg == "RS512"
-                    keysetdict[kid] = JWKRSA(MbedTLS.MD_SHA, pubkey(n, e, MbedTLS.MD_SHA))
+                    keysetdict[kid] = JWKRSA(alg, rsa_public_key(n, e))
                 else
                     @warn("key alg $alg not supported yet, skipping key $kid")
                     continue
@@ -355,11 +363,11 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
             elseif kty == "oct"
                 k = base64decode(urldec(key["k"]))
                 if alg == "HS256"
-                    keysetdict[kid] = JWKSymmetric(MbedTLS.MD_SHA256, k)
+                    keysetdict[kid] = JWKSymmetric(alg, k)
                 elseif alg == "HS384"
-                    keysetdict[kid] = JWKSymmetric(MbedTLS.MD_SHA384, k)
+                    keysetdict[kid] = JWKSymmetric(alg, k)
                 elseif alg == "HS512"
-                    keysetdict[kid] = JWKSymmetric(MbedTLS.MD_SHA, k)
+                    keysetdict[kid] = JWKSymmetric(alg, k)
                 else
                     @warn("key alg $alg not supported yet, skipping key $kid")
                     continue
@@ -373,14 +381,6 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
         end
     end
     nothing
-end
-
-function pubkey(bytesn, bytese, halg)
-    n = parse(BigInt, bytes2hex(bytesn); base=16)
-    e = parse(BigInt, bytes2hex(bytese); base=16)
-
-    R = RSA(MbedTLS.MBEDTLS_RSA_PKCS_V15, halg)
-    MbedTLS.pubkey_from_vals!(R, e, n)
 end
 
 function urldec(bs)

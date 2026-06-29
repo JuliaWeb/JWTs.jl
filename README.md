@@ -27,8 +27,8 @@ JWKSet 2 keys (https://www.googleapis.com/oauth2/v3/certs)
 julia> for (k,v) in keyset.keys
            println("    ", k, " => ", v.key)
        end
-    7978a91347261a291bd71dcab4a464be7d279666 => MbedTLS.RSA(Ptr{MbedTLS.mbedtls_rsa_context} @0x0000000001e337e0)
-    8aad66bdefc1b43d8db27e65e2e2ef301879d3e8 => MbedTLS.RSA(Ptr{MbedTLS.mbedtls_rsa_context} @0x0000000001d77390)
+    7978a91347261a291bd71dcab4a464be7d279666 => OpenSSLKey(Ptr{Nothing}(0x0000000001e337e0))
+    8aad66bdefc1b43d8db27e65e2e2ef301879d3e8 => OpenSSLKey(Ptr{Nothing}(0x0000000001d77390))
 ```
 
 While symmetric keys for signing can simply be read from a jwk file into a `JWKSet`, creating a JWKSet for asymmetric key signing needs to be done by the calling code. The process may vary depending on where the private key is stored, but as an example below is a snippet of code that picks up private keys from file corresponding to each key in a jwk file.
@@ -38,7 +38,7 @@ keyset = JWKSet(keyset_url)
 refresh!(keyset)
 signingkeyset = deepcopy(keyset)
 for k in keys(signingkeyset.keys)
-    signingkeyset.keys[k] = JWKRSA(signingkeyset.keys[k].kind, MbedTLS.parse_keyfile(joinpath(dirname(keyset_url), "$k.private.pem")))
+    signingkeyset.keys[k] = JWKRSA(JWTs.alg(signingkeyset.keys[k]), JWTs.parse_keyfile(joinpath(dirname(keyset_url), "$k.private.pem")))
 end
 ```
 

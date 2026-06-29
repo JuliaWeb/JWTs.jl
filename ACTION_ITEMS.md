@@ -52,7 +52,7 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
   - `julia --project=. --startup-file=no -e 'using Pkg; Pkg.test()'` passed with 578 tests.
   - `git diff --check` passed.
 
-### [ ] ITEM-003 (P0) Replace MbedTLS with OpenSSL_jll-backed crypto
+### [x] ITEM-003 (P0) Replace MbedTLS with OpenSSL_jll-backed crypto
 - Description: MbedTLS is the current crypto backend and should be removed because it is not the desired maintenance/security posture.
 - Desired outcome: Project.toml no longer depends on MbedTLS; existing HS256/HS384/HS512 and RS256/RS384/RS512 signing and verification continue to work through SHA.jl and direct OpenSSL_jll libcrypto calls.
 - Affected files: `Project.toml`, `src/JWTs.jl`, new crypto backend files under `src/`, `test/runtests.jl`, test key fixtures as needed.
@@ -72,6 +72,10 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
   - Existing callers that constructed MbedTLS key objects will need to move to package-provided PEM helpers; type names and high-level flows remain.
 - Completion criteria:
   - No package dependency or source dependency on MbedTLS remains, and existing RSA/HMAC behavior is covered by tests.
+- Verification evidence:
+  - `julia --project=. --startup-file=no -e 'using Pkg; Pkg.test()'` passed with 576 tests.
+  - `git diff --check` passed.
+  - `rg -n "MbedTLS" Project.toml src test README.md` returned no matches.
 
 ### [ ] ITEM-004 (P1) Add modern JOSE algorithm support
 - Description: JWTs.jl only supports HS* and RS* today; industry-standard JWT libraries usually support PS*, ES*, and EdDSA as well.
