@@ -193,7 +193,7 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
   - `julia --project=. --startup-file=no -e 'using Pkg; Pkg.test()'` passed with 2038 tests.
   - `git diff --check` passed.
 
-### [ ] ITEM-009 (P0) Open PR and watch CI to green
+### [x] ITEM-009 (P0) Open PR and watch CI to green
 - Description: The user requested a PR with the complete stacked commit series and final CI review.
 - Desired outcome: Push branch, open a human-readable PR without agent marker in the title, include `Co-authored by Codex` in the PR description, and watch CI until green or fix failures with additional focused commits.
 - Affected files: GitHub PR state
@@ -210,6 +210,10 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
   - GitHub credentials are available for JuliaWeb/JWTs.jl or a fork workflow.
 - Completion criteria:
   - PR exists, all intended commits are present, and CI is green.
+- Verification evidence:
+  - Opened draft PR #39: https://github.com/JuliaWeb/JWTs.jl/pull/39
+  - Pushed branch `codex/production-grade-jwt-verifier`.
+  - GitHub Actions run 28410011143 passed all CI and Codecov checks for head `506932e9d03031a8c9b8ad39cb252734ce0902df`.
 
 ## Compaction Continuity Block
 
