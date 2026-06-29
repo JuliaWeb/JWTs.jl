@@ -14,6 +14,7 @@ export issigned, isverified, isvalid
 export validate!, sign!, refresh!
 export show, claims, kid
 export with_valid_jwt
+export Verifier, VerifiedJWT, verify
 
 struct JWKSymmetric
     alg::String
@@ -504,5 +505,7 @@ function with_valid_jwt(f::Function, jwt::JWT, keyset::JWKSet;
 
     return f(jwt)
 end
+
+include("verifier.jl")
 
 end # module JWTs

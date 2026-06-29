@@ -103,7 +103,7 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
   - `git diff --check` passed.
   - `rg -n "MbedTLS" Project.toml src test README.md` returned no matches.
 
-### [ ] ITEM-005 (P1) Add verifier options, verified result, and registered claim validation
+### [x] ITEM-005 (P1) Add verifier options, verified result, and registered claim validation
 - Description: JWTs.jl validates signatures but not standard JWT claims like `exp`, `nbf`, `iat`, `iss`, `aud`, `sub`, `jti`, or `nonce`.
 - Desired outcome: Add a provider-neutral verifier interface that returns a verified result object and validates common registered claims with explicit options and leeway.
 - Affected files: `src/JWTs.jl`, possible new verifier files under `src/`, `test/runtests.jl`, `README.md`
@@ -122,6 +122,9 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
   - The new verifier interface can be added without making every legacy caller adopt it immediately.
 - Completion criteria:
   - Tests demonstrate safe end-to-end verification with signature and claim validation, and invalid signatures cannot expose trusted claims through the new result API.
+- Verification evidence:
+  - `julia --project=. --startup-file=no -e 'using Pkg; Pkg.test()'` passed with 2016 tests.
+  - `git diff --check` passed.
 
 ### [ ] ITEM-006 (P1) Add remote JWKS caching and OIDC discovery
 - Description: Production JWT verification usually needs cached remote JWKS resolution and optional OpenID Connect discovery, similar to OktaJWTVerifier.jl but provider-neutral.

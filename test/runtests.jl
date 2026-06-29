@@ -255,6 +255,112 @@ function test_validation_state_safety(keyset_url)
     @test_throws ArgumentError validate!(malformed, key; algorithms=[JWTs.alg(key)])
 end
 
+function test_verifier_claims(keyset_url)
+    print_header("verifier claims")
+
+    keyset = JWKSet(keyset_url)
+    refresh!(keyset)
+    keyid = first(k for (k, v) in keyset.keys if JWTs.alg(v) == "HS256")
+    algorithm = JWTs.alg(keyset.keys[keyid])
+
+    function signed(payload)
+        jwt = JWT(; payload=payload)
+        sign!(jwt, keyset, keyid)
+        return jwt
+    end
+
+    base_payload = Dict{String,Any}(
+        "iss" => "https://issuer.example",
+        "sub" => "subject-1",
+        "aud" => ["api://default", "web-client"],
+        "exp" => 1100,
+        "nbf" => 900,
+        "iat" => 950,
+        "jti" => "token-1",
+        "nonce" => "nonce-1",
+    )
+    jwt = signed(base_payload)
+    verifier = Verifier(
+        keyset;
+        algorithms=[algorithm],
+        issuer="https://issuer.example",
+        audience="api://default",
+        subject="subject-1",
+        jwtid="token-1",
+        nonce="nonce-1",
+        required_claims=["exp", "nbf", "iat"],
+        now=() -> 1000.0,
+    )
+
+    verified = verify(verifier, string(jwt))
+    @test verified.token isa JWT
+    @test verified.header["typ"] == "JWT"
+    @test JWTs.claims(verified) == base_payload
+    @test JWTs.kid(verified) == keyid
+    @test JWTs.alg(verified) == algorithm
+    @test verified.key === keyset.keys[keyid]
+    @test verify(verifier, jwt).claims == base_payload
+
+    vector_audience_verifier = Verifier(keyset; algorithms=[algorithm], audience=["mobile-client", "web-client"], now=() -> 1000.0)
+    @test verify(vector_audience_verifier, signed(base_payload)).claims == base_payload
+
+    string_audience_payload = copy(base_payload)
+    string_audience_payload["aud"] = "api://default"
+    @test verify(verifier, signed(string_audience_payload)).claims == string_audience_payload
+
+    @test_throws ArgumentError Verifier(keyset)
+    @test_throws ArgumentError Verifier(keyset; algorithms=String[])
+    @test_throws ArgumentError Verifier(keyset; algorithms=["none"])
+    @test_throws ArgumentError verify(Verifier(keyset; algorithms=["HS384"], now=() -> 1000.0), string(jwt))
+    @test_throws ArgumentError verify(verifier, tamper_signature(jwt))
+
+    wrong_issuer = Verifier(keyset; algorithms=[algorithm], issuer="https://wrong.example", now=() -> 1000.0)
+    @test_throws ArgumentError verify(wrong_issuer, signed(base_payload))
+
+    wrong_audience = Verifier(keyset; algorithms=[algorithm], audience="other-audience", now=() -> 1000.0)
+    @test_throws ArgumentError verify(wrong_audience, signed(base_payload))
+
+    wrong_subject = Verifier(keyset; algorithms=[algorithm], subject="subject-2", now=() -> 1000.0)
+    @test_throws ArgumentError verify(wrong_subject, signed(base_payload))
+
+    wrong_jti = Verifier(keyset; algorithms=[algorithm], jwtid="token-2", now=() -> 1000.0)
+    @test_throws ArgumentError verify(wrong_jti, signed(base_payload))
+
+    wrong_nonce = Verifier(keyset; algorithms=[algorithm], nonce="nonce-2", now=() -> 1000.0)
+    @test_throws ArgumentError verify(wrong_nonce, signed(base_payload))
+
+    expired = copy(base_payload)
+    expired["exp"] = 999
+    @test_throws ArgumentError verify(verifier, signed(expired))
+
+    not_before = copy(base_payload)
+    not_before["nbf"] = 1001
+    @test_throws ArgumentError verify(verifier, signed(not_before))
+
+    future_iat = copy(base_payload)
+    future_iat["iat"] = 1001
+    @test_throws ArgumentError verify(verifier, signed(future_iat))
+
+    missing_required = copy(base_payload)
+    delete!(missing_required, "exp")
+    @test_throws ArgumentError verify(verifier, signed(missing_required))
+
+    leeway_payload = copy(base_payload)
+    leeway_payload["exp"] = 995
+    leeway_payload["nbf"] = 1005
+    leeway_payload["iat"] = 1005
+    leeway_verifier = Verifier(keyset; algorithms=[algorithm], leeway=10, required_claims=["exp", "nbf", "iat"], now=() -> 1000.0)
+    @test verify(leeway_verifier, signed(leeway_payload)).claims == leeway_payload
+
+    max_age_verifier = Verifier(keyset; algorithms=[algorithm], max_age=100, now=() -> 1000.0)
+    old_token = copy(base_payload)
+    old_token["iat"] = 899
+    @test_throws ArgumentError verify(max_age_verifier, signed(old_token))
+    fresh_token = copy(base_payload)
+    fresh_token["iat"] = 901
+    @test verify(max_age_verifier, signed(fresh_token)).claims == fresh_token
+end
+
 @testset "JWTs" begin
     @testset "signing" begin
         test_and_get_keyset("https://www.googleapis.com/oauth2/v3/certs")
@@ -266,6 +372,7 @@ end
         test_signing_asymmetric_keys("file://" * joinpath(@__DIR__, "keys", "okp", "jwkkey.json"), ["EdDSA"])
         test_with_valid_jwt("file://" * joinpath(@__DIR__, "keys", "oct", "jwkkey.json"), ["HS256", "HS384", "HS512"])
         test_validation_state_safety("file://" * joinpath(@__DIR__, "keys", "oct", "jwkkey.json"))
+        test_verifier_claims("file://" * joinpath(@__DIR__, "keys", "oct", "jwkkey.json"))
     end
 
     @testset "alg" begin
