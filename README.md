@@ -3,149 +3,208 @@
 [![Build Status](https://github.com/JuliaWeb/JWTs.jl/workflows/CI/badge.svg)](https://github.com/JuliaWeb/JWTs.jl/actions?query=workflow%3ACI+branch%3Amaster)
 [![codecov](https://codecov.io/gh/JuliaWeb/JWTs.jl/branch/master/graph/badge.svg?token=VK7JZ2hMQx)](https://codecov.io/gh/JuliaWeb/JWTs.jl)
 
-JSON Web Tokens (JWT) are an open, industry standard [RFC 7519](https://tools.ietf.org/html/rfc7519) method for representing and transferring claims securely between two parties.
+JWTs.jl signs and verifies JSON Web Tokens (JWTs) and JSON Web Keys (JWKs). It supports local key sets, cached remote JWKS endpoints, and OpenID Connect discovery without requiring HTTP.jl.
 
-## Keys and Key Sets
+## Supported Algorithms
 
-**JWK** represents a JWK Key (either for signing or verification). JWK can be either a **JWKRSA** or **JWKSymmetric**. A RSA key can represent either the public or private key. Ref: https://datatracker.ietf.org/doc/html/rfc7517
+JWTs.jl supports these JOSE signing algorithms:
 
-**JWKSet** holds a set of keys, fetched from a OpenId key URL, each key identified by a key id. The OpenId key URL is usually found in the OpenId configuration (e.g. `jwks_uri` element in <https://accounts.google.com/.well-known/openid-configuration>).
+- HMAC: `HS256`, `HS384`, `HS512`
+- RSA PKCS#1 v1.5: `RS256`, `RS384`, `RS512`
+- RSA-PSS: `PS256`, `PS384`, `PS512`
+- ECDSA: `ES256`, `ES384`, `ES512`
+- EdDSA: `EdDSA` with Ed25519 keys
 
-To create or verify JWT, using a JWKSet is preferred as it provides mechanism of dealing with key rotation. To refresh a JWKSet, or to load keys for the first time, call the `refresh!` method on it.
+Asymmetric crypto uses OpenSSL through OpenSSL_jll. HMAC uses SHA.jl.
+
+## Keys
+
+`JWTs.JWKSet` stores keys by `kid`. It can be created from a JWKS URL, a `file://` URL, or an in-memory vector of parsed JWK dictionaries.
 
 ```julia
-julia> using JWTs
+using JWTs
 
-julia> keyset = JWKSet("https://www.googleapis.com/oauth2/v3/certs")
-JWKSet 0 keys (https://www.googleapis.com/oauth2/v3/certs)
+keyset = JWTs.JWKSet("https://issuer.example/oauth2/default/keys")
+JWTs.refresh!(keyset)
 
-julia> refresh!(keyset)
-
-julia> keyset
-JWKSet 2 keys (https://www.googleapis.com/oauth2/v3/certs)
-
-julia> for (k,v) in keyset.keys
-           println("    ", k, " => ", v.key)
-       end
-    7978a91347261a291bd71dcab4a464be7d279666 => OpenSSLKey(Ptr{Nothing}(0x0000000001e337e0))
-    8aad66bdefc1b43d8db27e65e2e2ef301879d3e8 => OpenSSLKey(Ptr{Nothing}(0x0000000001d77390))
+key = keyset.keys["signing-key-id"]
+JWTs.alg(key)
 ```
 
-While symmetric keys for signing can simply be read from a jwk file into a `JWKSet`, creating a JWKSet for asymmetric key signing needs to be done by the calling code. The process may vary depending on where the private key is stored, but as an example below is a snippet of code that picks up private keys from file corresponding to each key in a jwk file.
+Private PEM keys can be loaded with `JWTs.parse_keyfile`.
 
 ```julia
-keyset = JWKSet(keyset_url)
-refresh!(keyset)
-signingkeyset = deepcopy(keyset)
-for k in keys(signingkeyset.keys)
-    signingkeyset.keys[k] = JWKRSA(JWTs.alg(signingkeyset.keys[k]), JWTs.parse_keyfile(joinpath(dirname(keyset_url), "$k.private.pem")))
+private_key = JWTs.parse_keyfile("/secure/path/rs256.private.pem")
+signing_key = JWTs.JWKRSA("RS256", private_key)
+```
+
+For EC and OKP keys, use the namespaced constructors:
+
+```julia
+ec_key = JWTs.JWKEC("ES256", JWTs.parse_keyfile("/secure/path/es256.private.pem"), "P-256")
+okp_key = JWTs.JWKOKP("EdDSA", JWTs.parse_keyfile("/secure/path/ed25519.private.pem"), "Ed25519")
+```
+
+## Signing
+
+Create a token from a claims dictionary, then sign it with a key and `kid`.
+
+```julia
+payload = Dict(
+    "iss" => "https://issuer.example/oauth2/default",
+    "sub" => "user-123",
+    "aud" => "api://default",
+    "iat" => floor(Int, time()),
+    "exp" => floor(Int, time()) + 300,
+)
+
+jwt = JWTs.JWT(; payload=payload)
+JWTs.sign!(jwt, signing_key, "signing-key-id")
+String(jwt)
+```
+
+You can also sign from a key set:
+
+```julia
+JWTs.sign!(jwt, signing_keyset, "signing-key-id")
+```
+
+## Verification With Claims
+
+For applications, prefer `JWTs.Verifier` over calling `validate!` directly. A verifier checks the signature, enforces an explicit algorithm allowlist, validates registered claims, and returns a `JWTs.VerifiedJWT` only after all checks pass.
+
+```julia
+verifier = JWTs.Verifier(
+    keyset;
+    algorithms=["RS256"],
+    issuer="https://issuer.example/oauth2/default",
+    audience="api://default",
+    leeway=60,
+    required_claims=["exp", "iat"],
+)
+
+verified = JWTs.verify(verifier, token_string)
+claims = JWTs.claims(verified)
+claims["sub"]
+```
+
+Supported verifier options include:
+
+- `algorithms`: required explicit allowlist such as `["RS256"]`
+- `issuer`: expected `iss`
+- `audience`: expected `aud`, as a string or list of accepted audiences
+- `subject`: expected `sub`
+- `jwtid`: expected `jti`
+- `nonce`: expected `nonce`
+- `leeway`: clock skew allowance in seconds
+- `max_age`: maximum token age from `iat`
+- `required_claims`: claims that must be present
+- `now`: injectable clock, useful for deterministic tests
+
+`aud` may be either a string or an array of strings, matching RFC 7519.
+
+## Remote JWKS
+
+For a provider JWKS endpoint, construct a verifier with `jwks_uri`. Keys are fetched lazily, cached for `jwks_ttl` seconds, refreshed when stale, and refreshed early when a token contains an unknown `kid`.
+
+```julia
+verifier = JWTs.Verifier(;
+    jwks_uri="https://issuer.example/oauth2/default/keys",
+    algorithms=["RS256"],
+    issuer="https://issuer.example/oauth2/default",
+    audience="api://default",
+    jwks_ttl=300,
+    refresh_cooldown=30,
+)
+
+verified = JWTs.verify(verifier, token_string)
+```
+
+`refresh_cooldown` prevents repeated failed refresh attempts from turning every bad token into a network request. The last good key set is retained when a later refresh fails.
+
+Tests can inject a deterministic fetcher:
+
+```julia
+fetcher = url -> read("fixtures/jwks.json", String)
+verifier = JWTs.Verifier(; jwks_uri="https://issuer.example/keys", algorithms=["RS256"], fetcher=fetcher)
+```
+
+The default fetcher uses Downloads.jl.
+
+## OpenID Connect Discovery
+
+Pass an issuer URL as the first argument to use OpenID Connect discovery. JWTs.jl fetches `/.well-known/openid-configuration`, validates a matching discovery `issuer` when present, reads `jwks_uri`, and then uses the same cached remote JWKS behavior.
+
+```julia
+verifier = JWTs.Verifier(
+    "https://issuer.example/oauth2/default";
+    algorithms=["RS256"],
+    audience="api://default",
+    metadata_ttl=300,
+    jwks_ttl=300,
+)
+
+verified = JWTs.verify(verifier, token_string)
+```
+
+Use `discovery_path` if your provider uses a non-default discovery document path.
+
+## Lower-Level Signature Validation
+
+`JWTs.validate!` and `JWTs.with_valid_jwt` remain available as lower-level signature validation helpers. They do not validate registered claims such as `exp`, `nbf`, `iat`, `iss`, or `aud`.
+
+```julia
+jwt = JWTs.JWT(token_string)
+JWTs.validate!(jwt, keyset, "signing-key-id"; algorithms=["RS256"])
+```
+
+Use these helpers when you intentionally want only signature validation. Use `JWTs.Verifier` for application authentication and authorization boundaries.
+
+## Errors
+
+Verifier runtime failures throw subtypes of `JWTs.JWTError`:
+
+- `JWTs.JWTVerificationError`: malformed, unsigned, disallowed-algorithm, or invalid-signature tokens
+- `JWTs.JWTClaimError`: missing, malformed, expired, not-yet-valid, or mismatched claims
+- `JWTs.JWKSError`: JWKS, OIDC discovery, fetch, parse, cooldown, or missing-key failures
+
+Constructor option mistakes still throw `ArgumentError`.
+
+```julia
+try
+    JWTs.verify(verifier, token_string)
+catch err
+    if err isa JWTs.JWTClaimError
+        # token was signed but did not satisfy the configured claim policy
+    elseif err isa JWTs.JWTVerificationError
+        # token signature, header, or algorithm policy failed
+    elseif err isa JWTs.JWKSError
+        # key discovery or key lookup failed
+    else
+        rethrow()
+    end
 end
 ```
 
-The `alg` method on a JWK returns the algorithm used for the key.
+## Security Notes
+
+- Always pass an explicit `algorithms` allowlist to `JWTs.Verifier`.
+- Do not choose accepted algorithms from the untrusted token header.
+- Prefer asymmetric algorithms such as `RS256`, `PS256`, `ES256`, or `EdDSA` for third-party issuer verification.
+- Validate `iss` and `aud` for tokens accepted at service boundaries.
+- Use `nonce` for ID-token replay protection when your protocol requires it.
+- Keep key fetchers restricted to trusted issuer URLs.
+
+## Migrating From MbedTLS
+
+JWTs.jl no longer depends on MbedTLS. Replace direct MbedTLS key parsing with `JWTs.parse_keyfile`.
 
 ```julia
-julia> JWTs.alg(keyset.keys["7978a91347261a291bd71dcab4a464be7d279666"])
-"RS256"
+# Old
+# key = JWKRSA("RS256", MbedTLS.parse_keyfile("rs256.private.pem"))
+
+# New
+key = JWTs.JWKRSA("RS256", JWTs.parse_keyfile("rs256.private.pem"))
 ```
 
-## Tokens
-
-**JWT** represents a JSON Web Token containing the payload at the minimum. When signed, it holds the header (with key id and algorithm used) and signature too. The parts are stored in encoded form.
-
-```julia
-julia> using JSON
-
-julia> using JWTs
-
-julia> payload = JSON.parse("""{
-           "iss": "https://auth2.juliacomputing.io/dex",
-           "sub": "ChUxjfgsajfurjsjdut0483672kdhgstgy283jssZQ",
-           "aud": "example-audience",
-           "exp": 1536080651,
-           "iat": 1535994251,
-           "nonce": "1777777777777aaaaaaaaabbbbbbbbbb",
-           "at_hash": "222222-G-JJJJJJJJJJJJJ",
-           "email": "user@example.com",
-           "email_verified": true,
-           "name": "Example User"
-       }""");
-
-julia> jwt = JWT(; payload=payload)
-eyJuYW1lIjoiRXhhbXBsZSBVc2VyIiwiZXhwIjoxNTM2MDgwNjUxLCJhdWQiOiJleGFtcGxlLWF1ZGllbmNlIiwic3ViIjoiQ2hVeGpmZ3NhamZ1cmpzamR1dDA0ODM2NzJrZGhnc3RneTI4M2pzc1pRIiwiaWF0IjoxNTM1OTk0MjUxLCJpc3MiOiJodHRwczovL2F1dGgyLmp1bGlhY29tcHV0aW5nLmlvL2RleCIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdF9oYXNoIjoiMjIyMjIyLUctSkpKSkpKSkpKSkpKSiIsIm5vbmNlIjoiMTc3Nzc3Nzc3Nzc3N2FhYWFhYWFhYWJiYmJiYmJiYmIiLCJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20ifQ
-```
-
-A JWT can be signed using the `sign!` method, passing a key set and a key id to sign it with.
-
-```julia
-julia> issigned(jwt)
-false
-
-julia> keyset = JWKSet("file:///my/secret/location/jwkkey.json");
-
-julia> refresh!(keyset)
-
-julia> keyid = first(first(keyset.keys)) # using the first key in the key set
-"4Fytp3LfBhriD0eZ-k3aNS042bDiCZXg6bQNJmYoaE"
-
-julia> sign!(jwt, keyset, keyid)
-
-julia> issigned(jwt)
-true
-
-julia> jwt # note the additional header and signature
-eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiIsImtpZCI6IjRGeXRwM0xmQmhyaUQwZVotazNhTlMwNDJiRGlDWlhnNmJRTkptWW9hRSJ9.eyJuYW1lIjoiRXhhbXBsZSBVc2VyIiwiZXhwIjoxNTM2MDgwNjUxLCJhdWQiOiJleGFtcGxlLWF1ZGllbmNlIiwic3ViIjoiQ2hVeGpmZ3NhamZ1cmpzamR1dDA0ODM2NzJrZGhnc3RneTI4M2pzc1pRIiwiaWF0IjoxNTM1OTk0MjUxLCJpc3MiOiJodHRwczovL2F1dGgyLmp1bGlhY29tcHV0aW5nLmlvL2RleCIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdF9oYXNoIjoiMjIyMjIyLUctSkpKSkpKSkpKSkpKSiIsIm5vbmNlIjoiMTc3Nzc3Nzc3Nzc3N2FhYWFhYWFhYWJiYmJiYmJiYmIiLCJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20ifQ.zfq-DT4Ft_MSU34pwFrMaealWGs0j7Ynhs9iKjf5Uf4
-```
-
-The `kid` method shows the key id used to sign a JWT. This is useful while validating a JWT.
-
-```julia
-julia> kid(jwt)
-"4Fytp3LfBhriD0eZ-k3aNS042bDiCZXg6bQNJmYoaE"
-```
-
-The `alg` method shows the algorithm used to sign a JWT.
-
-```julia
-julia> alg(jwt)
-"RS256"
-```
-
-## Validation
-
-To validate a JWT against a key, call the `validate!` method, passing a key set and the key id to use.
-
-The `isvalid` method can be used to check if a JWT is valid (or has been validated at all). It returns `nothing` if validation has not been attempted and a `Bool` indicating validity if it has been validated earlier.
-
-```julia
-julia> isvalid(jwt2)
-
-julia> validate!(jwt, keyset, keyname)
-true
-
-julia> isvalid(jwt)
-true
-```
-
-The `with_valid_jwt` method can be used to Run `f` with a valid JWT. The validated JWT is passed as an argument to `f`. If the JWT is invalid, an `ArgumentError` is thrown.
-
-```julia
-julia> with_valid_jwt(jwt2, keyset) do valid_jwt
-           @info("claims", claims(valid_jwt))
-       end
-┌ Info: claims
-│   claims(valid_jwt) =
-│    Dict{String, Any} with 10 entries:
-│      "name"           => "Example User"
-│      "exp"            => 1536080651
-│      "aud"            => "example-audience"
-...
-└      "email"          => "user@example.com"
-```
-
-Both `validate!` and `with_valid_jwt` methods can optionally take an `algorithms` argument, which is a list of algorithms to validate against. If the JWT's algorithm is not in the list, the validation will fail.
-
-```julia
-julia> validate!(jwt, keyset, keyname; algorithms=["RS256"])
-true
-```
+The high-level `JWTs.JWT`, `JWTs.JWKSet`, `JWTs.sign!`, `JWTs.validate!`, `JWTs.with_valid_jwt`, and `JWTs.claims` APIs remain available. New application code should prefer `JWTs.Verifier` and `JWTs.verify` for end-to-end verification.

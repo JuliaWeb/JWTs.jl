@@ -130,13 +130,13 @@ end
 
 function claim_number(claimset, name::String)
     value = get(claimset, name, nothing)
-    value isa Real || throw(ArgumentError("jwt claim $name must be numeric"))
+    value isa Real || throw(JWTClaimError(:claim_type, "jwt claim $name must be numeric"))
     return Float64(value)
 end
 
 function claim_string(claimset, name::String)
     value = get(claimset, name, nothing)
-    value isa AbstractString || throw(ArgumentError("jwt claim $name must be a string"))
+    value isa AbstractString || throw(JWTClaimError(:claim_type, "jwt claim $name must be a string"))
     return String(value)
 end
 
@@ -146,17 +146,17 @@ function claim_audiences(claimset)
     if value isa AbstractVector
         audiences = String[]
         for aud in value
-            aud isa AbstractString || throw(ArgumentError("jwt claim aud entries must be strings"))
+            aud isa AbstractString || throw(JWTClaimError(:claim_type, "jwt claim aud entries must be strings"))
             push!(audiences, String(aud))
         end
         return audiences
     end
-    throw(ArgumentError("jwt claim aud must be a string or array of strings"))
+    throw(JWTClaimError(:claim_type, "jwt claim aud must be a string or array of strings"))
 end
 
 function require_claims!(claimset, required_claims)
     for claim in required_claims
-        haskey(claimset, claim) || throw(ArgumentError("jwt missing required claim $claim"))
+        haskey(claimset, claim) || throw(JWTClaimError(:claim_missing, "jwt missing required claim $claim"))
     end
     return nothing
 end
@@ -166,32 +166,32 @@ function validate_time_claims!(claimset, verifier::Verifier, now_value::Real)
     leeway = verifier.leeway
     if haskey(claimset, "exp")
         exp = claim_number(claimset, "exp")
-        now_s <= exp + leeway || throw(ArgumentError("jwt expired"))
+        now_s <= exp + leeway || throw(JWTClaimError(:token_expired, "jwt expired"))
     end
     if haskey(claimset, "nbf")
         nbf = claim_number(claimset, "nbf")
-        now_s + leeway >= nbf || throw(ArgumentError("jwt not yet valid"))
+        now_s + leeway >= nbf || throw(JWTClaimError(:token_not_yet_valid, "jwt not yet valid"))
     end
     if haskey(claimset, "iat")
         iat = claim_number(claimset, "iat")
-        now_s + leeway >= iat || throw(ArgumentError("jwt issued in the future"))
+        now_s + leeway >= iat || throw(JWTClaimError(:token_issued_in_future, "jwt issued in the future"))
         if verifier.max_age !== nothing
-            now_s - iat <= verifier.max_age + leeway || throw(ArgumentError("jwt is older than max_age"))
+            now_s - iat <= verifier.max_age + leeway || throw(JWTClaimError(:token_too_old, "jwt is older than max_age"))
         end
     elseif verifier.max_age !== nothing
-        throw(ArgumentError("jwt missing required claim iat"))
+        throw(JWTClaimError(:claim_missing, "jwt missing required claim iat"))
     end
     return nothing
 end
 
 function validate_expected_claims!(claimset, verifier::Verifier)
-    verifier.issuer === nothing || claim_string(claimset, "iss") == verifier.issuer || throw(ArgumentError("jwt issuer mismatch"))
-    verifier.subject === nothing || claim_string(claimset, "sub") == verifier.subject || throw(ArgumentError("jwt subject mismatch"))
-    verifier.jwtid === nothing || claim_string(claimset, "jti") == verifier.jwtid || throw(ArgumentError("jwt id mismatch"))
-    verifier.nonce === nothing || claim_string(claimset, "nonce") == verifier.nonce || throw(ArgumentError("jwt nonce mismatch"))
+    verifier.issuer === nothing || claim_string(claimset, "iss") == verifier.issuer || throw(JWTClaimError(:claim_mismatch, "jwt issuer mismatch"))
+    verifier.subject === nothing || claim_string(claimset, "sub") == verifier.subject || throw(JWTClaimError(:claim_mismatch, "jwt subject mismatch"))
+    verifier.jwtid === nothing || claim_string(claimset, "jti") == verifier.jwtid || throw(JWTClaimError(:claim_mismatch, "jwt id mismatch"))
+    verifier.nonce === nothing || claim_string(claimset, "nonce") == verifier.nonce || throw(JWTClaimError(:claim_mismatch, "jwt nonce mismatch"))
     if verifier.audiences !== nothing
         actual = claim_audiences(claimset)
-        any(aud -> aud in verifier.audiences, actual) || throw(ArgumentError("jwt audience mismatch"))
+        any(aud -> aud in verifier.audiences, actual) || throw(JWTClaimError(:claim_mismatch, "jwt audience mismatch"))
     end
     return nothing
 end
@@ -206,16 +206,16 @@ end
 verify(verifier::Verifier, jwt::String) = verify(verifier, JWT(jwt))
 
 function verify(verifier::Verifier, jwt::JWT)
-    issigned(jwt) || throw(ArgumentError("jwt is not signed"))
+    issigned(jwt) || throw(JWTVerificationError(:token_unsigned, "jwt is not signed"))
     header = decodepart(jwt.header)
     header_alg = alg(jwt)
-    header_alg === nothing && throw(ArgumentError("jwt header does not include alg"))
-    header_alg in verifier.algorithms || throw(ArgumentError("jwt algorithm is not allowed"))
+    header_alg === nothing && throw(JWTVerificationError(:algorithm_missing, "jwt header does not include alg"))
+    header_alg in verifier.algorithms || throw(JWTVerificationError(:algorithm_disallowed, "jwt algorithm is not allowed"))
     header_kid = kid(jwt)
-    header_kid === nothing && throw(ArgumentError("jwt header does not include kid"))
+    header_kid === nothing && throw(JWTVerificationError(:key_id_missing, "jwt header does not include kid"))
     key = resolve_verification_key(verifier.keyset, header_kid)
     valid = validate!(jwt, key; algorithms=verifier.algorithms)
-    valid || throw(ArgumentError("invalid jwt signature"))
+    valid || throw(JWTVerificationError(:signature_invalid, "invalid jwt signature"))
     claimset = claims(jwt)
     validate_claims!(claimset, verifier, verifier.now())
     return VerifiedJWT(jwt, header, claimset, header_kid, header_alg, key)

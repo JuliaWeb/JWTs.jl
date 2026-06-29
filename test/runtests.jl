@@ -337,39 +337,39 @@ function test_verifier_claims(keyset_url)
     @test_throws ArgumentError Verifier(keyset)
     @test_throws ArgumentError Verifier(keyset; algorithms=String[])
     @test_throws ArgumentError Verifier(keyset; algorithms=["none"])
-    @test_throws ArgumentError verify(Verifier(keyset; algorithms=["HS384"], now=() -> 1000.0), string(jwt))
-    @test_throws ArgumentError verify(verifier, tamper_signature(jwt))
+    @test_throws JWTs.JWTVerificationError verify(Verifier(keyset; algorithms=["HS384"], now=() -> 1000.0), string(jwt))
+    @test_throws JWTs.JWTVerificationError verify(verifier, tamper_signature(jwt))
 
     wrong_issuer = Verifier(keyset; algorithms=[algorithm], issuer="https://wrong.example", now=() -> 1000.0)
-    @test_throws ArgumentError verify(wrong_issuer, signed(base_payload))
+    @test_throws JWTs.JWTClaimError verify(wrong_issuer, signed(base_payload))
 
     wrong_audience = Verifier(keyset; algorithms=[algorithm], audience="other-audience", now=() -> 1000.0)
-    @test_throws ArgumentError verify(wrong_audience, signed(base_payload))
+    @test_throws JWTs.JWTClaimError verify(wrong_audience, signed(base_payload))
 
     wrong_subject = Verifier(keyset; algorithms=[algorithm], subject="subject-2", now=() -> 1000.0)
-    @test_throws ArgumentError verify(wrong_subject, signed(base_payload))
+    @test_throws JWTs.JWTClaimError verify(wrong_subject, signed(base_payload))
 
     wrong_jti = Verifier(keyset; algorithms=[algorithm], jwtid="token-2", now=() -> 1000.0)
-    @test_throws ArgumentError verify(wrong_jti, signed(base_payload))
+    @test_throws JWTs.JWTClaimError verify(wrong_jti, signed(base_payload))
 
     wrong_nonce = Verifier(keyset; algorithms=[algorithm], nonce="nonce-2", now=() -> 1000.0)
-    @test_throws ArgumentError verify(wrong_nonce, signed(base_payload))
+    @test_throws JWTs.JWTClaimError verify(wrong_nonce, signed(base_payload))
 
     expired = copy(base_payload)
     expired["exp"] = 999
-    @test_throws ArgumentError verify(verifier, signed(expired))
+    @test_throws JWTs.JWTClaimError verify(verifier, signed(expired))
 
     not_before = copy(base_payload)
     not_before["nbf"] = 1001
-    @test_throws ArgumentError verify(verifier, signed(not_before))
+    @test_throws JWTs.JWTClaimError verify(verifier, signed(not_before))
 
     future_iat = copy(base_payload)
     future_iat["iat"] = 1001
-    @test_throws ArgumentError verify(verifier, signed(future_iat))
+    @test_throws JWTs.JWTClaimError verify(verifier, signed(future_iat))
 
     missing_required = copy(base_payload)
     delete!(missing_required, "exp")
-    @test_throws ArgumentError verify(verifier, signed(missing_required))
+    @test_throws JWTs.JWTClaimError verify(verifier, signed(missing_required))
 
     leeway_payload = copy(base_payload)
     leeway_payload["exp"] = 995
@@ -381,7 +381,7 @@ function test_verifier_claims(keyset_url)
     max_age_verifier = Verifier(keyset; algorithms=[algorithm], max_age=100, now=() -> 1000.0)
     old_token = copy(base_payload)
     old_token["iat"] = 899
-    @test_throws ArgumentError verify(max_age_verifier, signed(old_token))
+    @test_throws JWTs.JWTClaimError verify(max_age_verifier, signed(old_token))
     fresh_token = copy(base_payload)
     fresh_token["iat"] = 901
     @test verify(max_age_verifier, signed(fresh_token)).claims == fresh_token
@@ -442,9 +442,9 @@ function test_remote_jwks_and_oidc()
 
     clock.value += 11
     missing_kid = signed_with_key(signingkeyset, "rsakey1", "missing-rsa-key", payload)
-    @test_throws ArgumentError verify(verifier, missing_kid)
+    @test_throws JWTs.JWKSError verify(verifier, missing_kid)
     @test fetch_counts[jwks_uri] == 4
-    @test_throws ArgumentError verify(verifier, missing_kid)
+    @test_throws JWTs.JWKSError verify(verifier, missing_kid)
     @test fetch_counts[jwks_uri] == 4
 
     malformed_verifier = Verifier(;
@@ -453,7 +453,7 @@ function test_remote_jwks_and_oidc()
         fetcher=url -> "{bad json",
         now=clock,
     )
-    @test_throws ArgumentError verify(malformed_verifier, jwt1)
+    @test_throws JWTs.JWKSError verify(malformed_verifier, jwt1)
 
     failing_verifier = Verifier(;
         jwks_uri="https://issuer.example/failing-keys",
@@ -461,7 +461,7 @@ function test_remote_jwks_and_oidc()
         fetcher=url -> throw(ErrorException("network down")),
         now=clock,
     )
-    @test_throws ArgumentError verify(failing_verifier, jwt1)
+    @test_throws JWTs.JWKSError verify(failing_verifier, jwt1)
 
     discovery_url = JWTs.openid_configuration_url(issuer * "/", ".well-known/openid-configuration")
     @test discovery_url == issuer * "/.well-known/openid-configuration"
@@ -503,12 +503,12 @@ function test_remote_jwks_and_oidc()
         fetcher=missing_jwks_fetcher,
         now=clock,
     )
-    @test_throws ArgumentError verify(missing_jwks_verifier, jwt1)
+    @test_throws JWTs.JWKSError verify(missing_jwks_verifier, jwt1)
 end
 
 @testset "JWTs" begin
     @testset "signing" begin
-        test_and_get_keyset("https://www.googleapis.com/oauth2/v3/certs")
+        test_and_get_keyset("file://" * joinpath(@__DIR__, "keys", "rsa", "jwkkey.json"))
         test_signing_symmetric_keys("file://" * joinpath(@__DIR__, "keys", "oct", "jwkkey.json"), ["HS256", "HS384", "HS512"])
         test_in_mem_keyset(joinpath(@__DIR__, "keys", "oct", "jwkkey.json"))
         test_signing_asymmetric_keys("file://" * joinpath(@__DIR__, "keys", "rsa", "jwkkey.json"), ["RS256"])

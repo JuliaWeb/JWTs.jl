@@ -6,6 +6,7 @@ using Downloads
 using OpenSSL_jll
 using SHA
 
+include("errors.jl")
 include("crypto.jl")
 
 import Base: getproperty, setproperty!, show, isvalid

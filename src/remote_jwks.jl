@@ -125,7 +125,7 @@ function fetch_json_document(fetcher, url::String)
     raw = try
         fetcher(url)
     catch ex
-        throw(ArgumentError("failed to fetch JSON document from $url: $ex"))
+        throw(JWKSError(:fetch_failed, "failed to fetch JSON document from $url: $ex"))
     end
 
     if raw isa AbstractDict
@@ -134,23 +134,23 @@ function fetch_json_document(fetcher, url::String)
         try
             return JSON.parse(String(raw))
         catch ex
-            throw(ArgumentError("failed to parse JSON document from $url: $ex"))
+            throw(JWKSError(:parse_failed, "failed to parse JSON document from $url: $ex"))
         end
     elseif raw isa AbstractVector{UInt8}
         try
             return JSON.parse(String(raw))
         catch ex
-            throw(ArgumentError("failed to parse JSON document from $url: $ex"))
+            throw(JWKSError(:parse_failed, "failed to parse JSON document from $url: $ex"))
         end
     else
-        throw(ArgumentError("fetcher for $url returned unsupported type $(typeof(raw))"))
+        throw(JWKSError(:fetch_result_unsupported, "fetcher for $url returned unsupported type $(typeof(raw))"))
     end
 end
 
 function jwks_keys(doc, url::String)
-    doc isa AbstractDict || throw(ArgumentError("JWKS document from $url must be a JSON object"))
+    doc isa AbstractDict || throw(JWKSError(:jwks_invalid, "JWKS document from $url must be a JSON object"))
     keys = get(doc, "keys", nothing)
-    keys isa AbstractVector || throw(ArgumentError("JWKS document from $url is missing a keys array"))
+    keys isa AbstractVector || throw(JWKSError(:jwks_invalid, "JWKS document from $url is missing a keys array"))
     return keys
 end
 
@@ -162,7 +162,7 @@ end
 function refresh_remote_jwks_unlocked!(source::RemoteJWKSet, now_value::Float64; throw_if_empty::Bool)
     if in_cooldown(source.last_failure_at, now_value, source.refresh_cooldown)
         if throw_if_empty || isempty(source.keyset.keys)
-            throw(ArgumentError("JWKS refresh for $(source.jwks_uri) is in cooldown after a previous failure"))
+            throw(JWKSError(:jwks_refresh_cooldown, "JWKS refresh for $(source.jwks_uri) is in cooldown after a previous failure"))
         end
         return false
     end
@@ -179,7 +179,7 @@ function refresh_remote_jwks_unlocked!(source::RemoteJWKSet, now_value::Float64;
     catch ex
         source.last_failure_at = now_value
         if throw_if_empty || isempty(source.keyset.keys)
-            throw(ArgumentError("failed to refresh JWKS from $(source.jwks_uri): $ex"))
+            throw(JWKSError(:jwks_refresh_failed, "failed to refresh JWKS from $(source.jwks_uri): $ex"))
         end
         return false
     end
@@ -206,7 +206,7 @@ end
 
 function resolve_verification_key(keyset::JWKSet, keyid::String)
     haskey(keyset.keys, keyid) || refresh!(keyset)
-    haskey(keyset.keys, keyid) || throw(ArgumentError("JWK set does not contain key id $keyid"))
+    haskey(keyset.keys, keyid) || throw(JWKSError(:key_not_found, "JWK set does not contain key id $keyid"))
     return keyset.keys[keyid]
 end
 
@@ -220,7 +220,7 @@ function resolve_verification_key(source::RemoteJWKSet, keyid::String)
             source.last_unknown_refresh_at = now_value
             refresh_remote_jwks_unlocked!(source, now_value; throw_if_empty=false)
         end
-        haskey(source.keyset.keys, keyid) || throw(ArgumentError("JWK set does not contain key id $keyid"))
+        haskey(source.keyset.keys, keyid) || throw(JWKSError(:key_not_found, "JWK set does not contain key id $keyid"))
         return source.keyset.keys[keyid]
     finally
         unlock(source.lock)
@@ -230,21 +230,21 @@ end
 function refresh_oidc_discovery_unlocked!(source::OIDCDiscovery, now_value::Float64; throw_if_empty::Bool)
     if in_cooldown(source.last_failure_at, now_value, source.refresh_cooldown)
         if throw_if_empty || source.jwks === nothing
-            throw(ArgumentError("OIDC discovery refresh for $(source.issuer) is in cooldown after a previous failure"))
+            throw(JWKSError(:oidc_refresh_cooldown, "OIDC discovery refresh for $(source.issuer) is in cooldown after a previous failure"))
         end
         return false
     end
 
     try
         metadata = fetch_json_document(source.fetcher, source.discovery_uri)
-        metadata isa AbstractDict || throw(ArgumentError("OIDC discovery document must be a JSON object"))
+        metadata isa AbstractDict || throw(JWKSError(:oidc_invalid, "OIDC discovery document must be a JSON object"))
         discovered_issuer = get(metadata, "issuer", source.issuer)
-        discovered_issuer isa AbstractString || throw(ArgumentError("OIDC discovery issuer must be a string"))
+        discovered_issuer isa AbstractString || throw(JWKSError(:oidc_invalid, "OIDC discovery issuer must be a string"))
         rstrip(String(discovered_issuer), '/') == source.issuer ||
-            throw(ArgumentError("OIDC discovery issuer does not match configured issuer"))
+            throw(JWKSError(:oidc_issuer_mismatch, "OIDC discovery issuer does not match configured issuer"))
         jwks_uri = get(metadata, "jwks_uri", nothing)
-        jwks_uri isa AbstractString || throw(ArgumentError("OIDC discovery document is missing jwks_uri"))
-        isempty(jwks_uri) && throw(ArgumentError("OIDC discovery jwks_uri must not be empty"))
+        jwks_uri isa AbstractString || throw(JWKSError(:oidc_invalid, "OIDC discovery document is missing jwks_uri"))
+        isempty(jwks_uri) && throw(JWKSError(:oidc_invalid, "OIDC discovery jwks_uri must not be empty"))
         if source.jwks === nothing || source.jwks.jwks_uri != String(jwks_uri)
             source.jwks = RemoteJWKSet(
                 jwks_uri;
@@ -261,7 +261,7 @@ function refresh_oidc_discovery_unlocked!(source::OIDCDiscovery, now_value::Floa
     catch ex
         source.last_failure_at = now_value
         if throw_if_empty || source.jwks === nothing
-            throw(ArgumentError("failed to refresh OIDC discovery from $(source.discovery_uri): $ex"))
+            throw(JWKSError(:oidc_refresh_failed, "failed to refresh OIDC discovery from $(source.discovery_uri): $ex"))
         end
         return false
     end
@@ -276,7 +276,7 @@ function oidc_jwks_source!(source::OIDCDiscovery)
         elseif source.fetched_at === nothing || now_value - source.fetched_at >= source.metadata_ttl
             refresh_oidc_discovery_unlocked!(source, now_value; throw_if_empty=false)
         end
-        source.jwks === nothing && throw(ArgumentError("OIDC discovery did not provide a JWKS source"))
+        source.jwks === nothing && throw(JWKSError(:oidc_invalid, "OIDC discovery did not provide a JWKS source"))
         return source.jwks
     finally
         unlock(source.lock)

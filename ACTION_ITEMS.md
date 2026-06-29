@@ -148,7 +148,7 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
   - `julia --project=. --startup-file=no -e 'using Pkg; Pkg.test()'` passed with 2038 tests.
   - `git diff --check` passed.
 
-### [ ] ITEM-007 (P2) Improve error taxonomy, docs, and migration guidance
+### [x] ITEM-007 (P2) Improve error taxonomy, docs, and migration guidance
 - Description: Production users need clear errors, clear examples, and a migration path from old MbedTLS-backed key construction.
 - Desired outcome: README documents signing, signature validation, verifier/claim validation, remote JWKS/OIDC verification, supported algorithms, security guidance, and MbedTLS migration notes.
 - Affected files: `src/JWTs.jl`, `README.md`, possibly `docs/` if introduced
@@ -165,6 +165,10 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
   - README-level documentation is enough unless the package already grows a docs site in a later maintainer pass.
 - Completion criteria:
   - New API is discoverable and old-to-new migration is clear.
+- Verification evidence:
+  - `julia --project=. --startup-file=no -e 'using Pkg; Pkg.test()'` passed with 2038 tests.
+  - Replaced the old live Google certs test with local fixtures; remote JWKS/OIDC behavior remains covered by deterministic fake fetchers.
+  - `git diff --check` passed.
 
 ### [ ] ITEM-008 (P2) Modernize CI following JSON.jl patterns
 - Description: CI currently uses older action versions and a Julia 1.3 matrix. The final PR should have modern, maintainable CI.
