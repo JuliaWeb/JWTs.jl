@@ -1,5 +1,7 @@
+const VerifierKeySource = Union{JWKSet,RemoteJWKSet,OIDCDiscovery}
+
 struct Verifier
-    keyset::JWKSet
+    keyset::VerifierKeySource
     algorithms::Vector{String}
     issuer::Union{Nothing,String}
     audiences::Union{Nothing,Vector{String}}
@@ -39,7 +41,7 @@ function normalize_required_claims(required_claims)
 end
 
 function Verifier(
-    keyset::JWKSet;
+    keyset::VerifierKeySource;
     algorithms=nothing,
     issuer::Union{Nothing,AbstractString}=nothing,
     audience=nothing,
@@ -75,6 +77,56 @@ function Verifier(
 end
 
 Verifier(keys::Vector; kwargs...) = Verifier(JWKSet(keys); kwargs...)
+
+function Verifier(
+    issuer_url::AbstractString;
+    discovery_path::AbstractString="/.well-known/openid-configuration",
+    metadata_ttl::Real=300,
+    jwks_ttl::Real=300,
+    refresh_cooldown::Real=30,
+    default_algs=DEFAULT_JWK_ALGS,
+    fetcher=nothing,
+    downloader=nothing,
+    now=time,
+    kwargs...
+)
+    issuer_s = rstrip(String(issuer_url), '/')
+    source = OIDCDiscovery(
+        issuer_s;
+        discovery_path=discovery_path,
+        metadata_ttl=metadata_ttl,
+        jwks_ttl=jwks_ttl,
+        refresh_cooldown=refresh_cooldown,
+        default_algs=default_algs,
+        fetcher=fetcher,
+        downloader=downloader,
+        now=now,
+    )
+    return Verifier(source; issuer=issuer_s, now=now, kwargs...)
+end
+
+function Verifier(;
+    jwks_uri=nothing,
+    jwks_ttl::Real=300,
+    refresh_cooldown::Real=30,
+    default_algs=DEFAULT_JWK_ALGS,
+    fetcher=nothing,
+    downloader=nothing,
+    now=time,
+    kwargs...
+)
+    jwks_uri === nothing && throw(ArgumentError("Verifier requires a JWKSet, key vector, OIDC issuer, or jwks_uri"))
+    source = RemoteJWKSet(
+        jwks_uri;
+        ttl=jwks_ttl,
+        refresh_cooldown=refresh_cooldown,
+        default_algs=default_algs,
+        fetcher=fetcher,
+        downloader=downloader,
+        now=now,
+    )
+    return Verifier(source; now=now, kwargs...)
+end
 
 function claim_number(claimset, name::String)
     value = get(claimset, name, nothing)
@@ -161,9 +213,9 @@ function verify(verifier::Verifier, jwt::JWT)
     header_alg in verifier.algorithms || throw(ArgumentError("jwt algorithm is not allowed"))
     header_kid = kid(jwt)
     header_kid === nothing && throw(ArgumentError("jwt header does not include kid"))
-    valid = validate!(jwt, verifier.keyset, header_kid; algorithms=verifier.algorithms)
+    key = resolve_verification_key(verifier.keyset, header_kid)
+    valid = validate!(jwt, key; algorithms=verifier.algorithms)
     valid || throw(ArgumentError("invalid jwt signature"))
-    key = verifier.keyset.keys[header_kid]
     claimset = claims(jwt)
     validate_claims!(claimset, verifier, verifier.now())
     return VerifiedJWT(jwt, header, claimset, header_kid, header_alg, key)

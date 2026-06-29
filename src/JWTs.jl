@@ -373,14 +373,18 @@ function refresh!(keyset::JWKSet; default_algs = Dict("RSA" => "RS256", "oct" =>
     nothing
 end
 
-function refresh!(keyseturl::String, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing)
-    if startswith(keyseturl, "file://")
-        jstr = readchomp(keyseturl[8:end])
+function fetch_url(url::String; downloader=nothing)
+    if startswith(url, "file://")
+        return readchomp(url[8:end])
     else
         output = PipeBuffer()
-        Downloads.request(keyseturl; method="GET", output=output, downloader=downloader)
-        jstr = String(take!(output))
+        Downloads.request(url; method="GET", output=output, downloader=downloader)
+        return String(take!(output))
     end
+end
+
+function refresh!(keyseturl::String, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing)
+    jstr = fetch_url(keyseturl; downloader=downloader)
     keys = JSON.parse(jstr)["keys"]
     refresh!(keys, keysetdict; default_algs=default_algs)
 end
@@ -506,6 +510,7 @@ function with_valid_jwt(f::Function, jwt::JWT, keyset::JWKSet;
     return f(jwt)
 end
 
+include("remote_jwks.jl")
 include("verifier.jl")
 
 end # module JWTs

@@ -126,7 +126,7 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
   - `julia --project=. --startup-file=no -e 'using Pkg; Pkg.test()'` passed with 2016 tests.
   - `git diff --check` passed.
 
-### [ ] ITEM-006 (P1) Add remote JWKS caching and OIDC discovery
+### [x] ITEM-006 (P1) Add remote JWKS caching and OIDC discovery
 - Description: Production JWT verification usually needs cached remote JWKS resolution and optional OpenID Connect discovery, similar to OktaJWTVerifier.jl but provider-neutral.
 - Desired outcome: JWTs.jl can discover `jwks_uri`, cache JWKS with TTL/cooldown behavior, refresh on unknown `kid`, and verify tokens through the new verifier without provider-specific naming.
 - Affected files: `src/JWTs.jl`, possible new provider/cache files under `src/`, `test/runtests.jl`, `README.md`
@@ -144,6 +144,9 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
   - No additional heavy HTTP dependency is needed.
 - Completion criteria:
   - The provider-neutral verifier covers the useful OktaJWTVerifier.jl behavior without Okta-specific naming or assumptions.
+- Verification evidence:
+  - `julia --project=. --startup-file=no -e 'using Pkg; Pkg.test()'` passed with 2038 tests.
+  - `git diff --check` passed.
 
 ### [ ] ITEM-007 (P2) Improve error taxonomy, docs, and migration guidance
 - Description: Production users need clear errors, clear examples, and a migration path from old MbedTLS-backed key construction.

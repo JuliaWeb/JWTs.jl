@@ -76,6 +76,11 @@ function tamper_signature(jwt::JWT)
     JWT(; jwt=join([jwt.header, jwt.payload, JWTs.urlenc(base64encode(sig))], "."))
 end
 
+mutable struct TestClock
+    value::Float64
+end
+(clock::TestClock)() = clock.value
+
 function signing_jwk(public_jwk, keyfile)
     key = JWTs.parse_keyfile(keyfile)
     if public_jwk isa JWKRSA
@@ -87,6 +92,27 @@ function signing_jwk(public_jwk, keyfile)
     else
         throw(ArgumentError("unsupported asymmetric JWK type $(typeof(public_jwk))"))
     end
+end
+
+function jwks_doc_with_kids(path, wanted_kids)
+    doc = JSON.parse(read(path, String))
+    wanted = Set(wanted_kids)
+    return Dict("keys" => [key for key in doc["keys"] if key["kid"] in wanted])
+end
+
+function signing_keyset_from_jwks_doc(doc, keydir)
+    keyset = JWKSet(doc["keys"])
+    signingkeyset = deepcopy(keyset)
+    for (k, public_jwk) in collect(signingkeyset.keys)
+        signingkeyset.keys[k] = signing_jwk(public_jwk, joinpath(keydir, "$k.private.pem"))
+    end
+    return signingkeyset
+end
+
+function signed_with_key(signingkeyset, signing_kid, header_kid, payload)
+    jwt = JWT(; payload=payload)
+    sign!(jwt, signingkeyset.keys[signing_kid], header_kid)
+    return jwt
 end
 
 function test_signing_keys(keyset, signingkeyset, algorithms::Vector{String})
@@ -361,6 +387,125 @@ function test_verifier_claims(keyset_url)
     @test verify(max_age_verifier, signed(fresh_token)).claims == fresh_token
 end
 
+function test_remote_jwks_and_oidc()
+    print_header("remote JWKS and OIDC discovery")
+
+    issuer = "https://issuer.example/oauth2/default"
+    jwks_uri = "https://issuer.example/oauth2/default/keys"
+    rsa_dir = joinpath(@__DIR__, "keys", "rsa")
+    jwks_path = joinpath(rsa_dir, "jwkkey.json")
+    doc1 = jwks_doc_with_kids(jwks_path, ["rsakey1"])
+    doc2 = jwks_doc_with_kids(jwks_path, ["rsakey1", "rsakey2"])
+    signingkeyset = signing_keyset_from_jwks_doc(doc2, rsa_dir)
+    clock = TestClock(1000.0)
+    payload = Dict{String,Any}(
+        "iss" => issuer,
+        "sub" => "remote-user",
+        "aud" => "api://default",
+        "exp" => 2000,
+        "iat" => 900,
+    )
+
+    current_jwks = Ref{Any}(doc1)
+    fetch_counts = Dict{String,Int}()
+    fetcher = function(url)
+        fetch_counts[url] = get(fetch_counts, url, 0) + 1
+        url == jwks_uri || throw(ErrorException("unexpected URL $url"))
+        return current_jwks[]
+    end
+
+    verifier = Verifier(;
+        jwks_uri=jwks_uri,
+        algorithms=["RS256"],
+        issuer=issuer,
+        audience="api://default",
+        jwks_ttl=60,
+        refresh_cooldown=10,
+        fetcher=fetcher,
+        now=clock,
+    )
+
+    jwt1 = signed_with_key(signingkeyset, "rsakey1", "rsakey1", payload)
+    @test verify(verifier, jwt1).claims == payload
+    @test fetch_counts[jwks_uri] == 1
+    @test verify(verifier, string(jwt1)).claims == payload
+    @test fetch_counts[jwks_uri] == 1
+
+    clock.value += 61
+    @test verify(verifier, jwt1).claims == payload
+    @test fetch_counts[jwks_uri] == 2
+
+    current_jwks[] = doc2
+    jwt2 = signed_with_key(signingkeyset, "rsakey2", "rsakey2", payload)
+    @test JWTs.kid(verify(verifier, jwt2)) == "rsakey2"
+    @test fetch_counts[jwks_uri] == 3
+
+    clock.value += 11
+    missing_kid = signed_with_key(signingkeyset, "rsakey1", "missing-rsa-key", payload)
+    @test_throws ArgumentError verify(verifier, missing_kid)
+    @test fetch_counts[jwks_uri] == 4
+    @test_throws ArgumentError verify(verifier, missing_kid)
+    @test fetch_counts[jwks_uri] == 4
+
+    malformed_verifier = Verifier(;
+        jwks_uri="https://issuer.example/bad-keys",
+        algorithms=["RS256"],
+        fetcher=url -> "{bad json",
+        now=clock,
+    )
+    @test_throws ArgumentError verify(malformed_verifier, jwt1)
+
+    failing_verifier = Verifier(;
+        jwks_uri="https://issuer.example/failing-keys",
+        algorithms=["RS256"],
+        fetcher=url -> throw(ErrorException("network down")),
+        now=clock,
+    )
+    @test_throws ArgumentError verify(failing_verifier, jwt1)
+
+    discovery_url = JWTs.openid_configuration_url(issuer * "/", ".well-known/openid-configuration")
+    @test discovery_url == issuer * "/.well-known/openid-configuration"
+
+    discovery_counts = Dict{String,Int}()
+    discovery_fetcher = function(url)
+        discovery_counts[url] = get(discovery_counts, url, 0) + 1
+        if url == discovery_url
+            return Dict("issuer" => issuer, "jwks_uri" => jwks_uri)
+        elseif url == jwks_uri
+            return doc2
+        else
+            throw(ErrorException("unexpected URL $url"))
+        end
+    end
+
+    oidc_verifier = Verifier(
+        issuer;
+        algorithms=["RS256"],
+        audience="api://default",
+        metadata_ttl=30,
+        jwks_ttl=60,
+        refresh_cooldown=10,
+        fetcher=discovery_fetcher,
+        now=clock,
+    )
+    @test verify(oidc_verifier, jwt2).claims == payload
+    @test discovery_counts[discovery_url] == 1
+    @test discovery_counts[jwks_uri] == 1
+    @test verify(oidc_verifier, jwt2).claims == payload
+    @test discovery_counts[discovery_url] == 1
+    @test discovery_counts[jwks_uri] == 1
+
+    missing_jwks_fetcher = url -> Dict("issuer" => issuer)
+    missing_jwks_verifier = Verifier(
+        issuer;
+        algorithms=["RS256"],
+        audience="api://default",
+        fetcher=missing_jwks_fetcher,
+        now=clock,
+    )
+    @test_throws ArgumentError verify(missing_jwks_verifier, jwt1)
+end
+
 @testset "JWTs" begin
     @testset "signing" begin
         test_and_get_keyset("https://www.googleapis.com/oauth2/v3/certs")
@@ -373,6 +518,7 @@ end
         test_with_valid_jwt("file://" * joinpath(@__DIR__, "keys", "oct", "jwkkey.json"), ["HS256", "HS384", "HS512"])
         test_validation_state_safety("file://" * joinpath(@__DIR__, "keys", "oct", "jwkkey.json"))
         test_verifier_claims("file://" * joinpath(@__DIR__, "keys", "oct", "jwkkey.json"))
+        test_remote_jwks_and_oidc()
     end
 
     @testset "alg" begin
