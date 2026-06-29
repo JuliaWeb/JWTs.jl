@@ -2,6 +2,7 @@ using JWTs
 using Test
 using JSON
 using MbedTLS
+using Base64
 
 const test_payload_data = [
     JSON.parse("""{
@@ -83,6 +84,9 @@ function test_signing_keys(keyset, signingkeyset, algorithms::Vector{String})
             @test isvalid(jwt)
             @test isverified(jwt)
             @test claims(jwt) == d
+            @test_throws ArgumentError setproperty!(jwt, :payload, jwt.payload)
+            @test_throws ArgumentError setproperty!(jwt, :header, jwt.header)
+            @test_throws ArgumentError setproperty!(jwt, :signature, jwt.signature)
             @test JWTs.alg(jwt) == JWTs.alg(keyset.keys[k])
             @test kid(jwt) == k
             header = JWTs.decodepart(jwt.header)
@@ -98,6 +102,10 @@ function test_signing_keys(keyset, signingkeyset, algorithms::Vector{String})
             @test !isverified(jwt2)
             @test isvalid(jwt2) === nothing
             # test with valid algos
+            @test validate!(jwt, keyset, k; algorithms=algorithms)
+            @test !validate!(jwt, keyset, k; algorithms=["invalidalgo"])
+            @test isverified(jwt)
+            @test !isvalid(jwt)
             @test validate!(jwt, keyset, k; algorithms=algorithms)
 
             # test with invalid algos
@@ -125,6 +133,9 @@ function test_signing_keys(keyset, signingkeyset, algorithms::Vector{String})
             @test issigned(jwt2)
             @test !isvalid(jwt2)
             @test isverified(jwt2)
+            @test validate!(jwt, keyset, k; algorithms=algorithms)
+            @test !validate!(jwt, keyset, invalidkey; algorithms=algorithms)
+            @test validate!(jwt, keyset, k; algorithms=algorithms)
         end
     end
 end
@@ -171,10 +182,50 @@ function test_with_valid_jwt(keyset_url, algorithms::Vector{String})
         @test isvalid(jwt3)
         @test claims(jwt3) == d
     end
+    with_valid_jwt(string(jwt), keyset; kid=key) do jwt3
+        @test isvalid(jwt3)
+        @test claims(jwt3) == d
+    end
     with_valid_jwt(jwt2, keyset; kid=key) do jwt3
         @test isvalid(jwt3)
         @test claims(jwt3) == d
     end
+    @test_throws ArgumentError with_valid_jwt(identity, JWT(; jwt=string(jwt)), keyset; kid=key, algorithms=["invalidalgo"])
+end
+
+function test_validation_state_safety(keyset_url)
+    print_header("validation state safety")
+
+    keyset = JWKSet(keyset_url)
+    refresh!(keyset)
+    hs256_keyids = [k for (k, v) in keyset.keys if JWTs.alg(v) == "HS256"]
+    @test length(hs256_keyids) >= 2
+    keyid = hs256_keyids[1]
+    other_keyid = hs256_keyids[2]
+    key = keyset.keys[keyid]
+    payload = Dict("sub" => "state-test", "iat" => 1)
+
+    jwt = JWT(; payload=payload)
+    sign!(jwt, keyset, keyid)
+    @test validate!(jwt, keyset, keyid; algorithms=[JWTs.alg(key)])
+    @test !validate!(jwt, keyset, keyid; algorithms=["invalidalgo"])
+    @test validate!(jwt, keyset, keyid; algorithms=[JWTs.alg(key)])
+
+    @test !validate!(jwt, keyset, other_keyid; algorithms=[JWTs.alg(key)])
+    @test validate!(jwt, keyset, keyid; algorithms=[JWTs.alg(key)])
+
+    header_without_alg_or_kid = JWTs.urlenc(base64encode(JSON.json(Dict("typ" => "JWT"))))
+    missing_header_token = JWT(; jwt=join([header_without_alg_or_kid, jwt.payload, jwt.signature], "."))
+    @test JWTs.alg(missing_header_token) === nothing
+    @test kid(missing_header_token) === nothing
+    @test !validate!(missing_header_token, key; algorithms=[JWTs.alg(key)])
+    @test_throws ArgumentError validate!(missing_header_token, keyset; algorithms=[JWTs.alg(key)])
+
+    malformed = JWT(; jwt="not-a-valid-compact-token")
+    @test !issigned(malformed)
+    @test isverified(malformed)
+    @test isvalid(malformed) === false
+    @test_throws ArgumentError validate!(malformed, key; algorithms=[JWTs.alg(key)])
 end
 
 @testset "JWTs" begin
@@ -184,6 +235,7 @@ end
         test_in_mem_keyset(joinpath(@__DIR__, "keys", "oct", "jwkkey.json"))
         test_signing_asymmetric_keys("file://" * joinpath(@__DIR__, "keys", "rsa", "jwkkey.json"), ["RS256"])
         test_with_valid_jwt("file://" * joinpath(@__DIR__, "keys", "oct", "jwkkey.json"), ["HS256", "HS384", "HS512"])
+        test_validation_state_safety("file://" * joinpath(@__DIR__, "keys", "oct", "jwkkey.json"))
     end
 
     @testset "alg" begin

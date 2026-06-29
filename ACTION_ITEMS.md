@@ -29,7 +29,7 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
   - `git diff --check` passed.
   - `git status --short` showed only `ACTION_ITEMS.md` before commit.
 
-### [ ] ITEM-002 (P0) Make JWT parsing and validation state safe
+### [x] ITEM-002 (P0) Make JWT parsing and validation state safe
 - Description: The current mutable JWT stores stale `verified`/`valid` state, so a token can remain valid after payload mutation or after validation with different keys/algorithm policies.
 - Desired outcome: JWT token data is immutable after construction, validation is policy-local and cannot be reused across keys or algorithm allowlists, malformed/missing headers fail predictably, and existing `isverified`/`isvalid` compatibility remains as non-breaking as practical.
 - Affected files: `src/JWTs.jl`, `test/runtests.jl`
@@ -45,8 +45,12 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
 - Assumptions:
   - Making mutable fields immutable is acceptable under the user's stated compatibility preference.
   - Compatibility accessors can report the last attempted validation result, but validation itself must always recompute for the supplied policy.
+  - To preserve existing `sign!(jwt, ...)` call sites for now, this item may keep `JWT` internally mutable while preventing normal public mutation of `payload`, `header`, `signature`, `verified`, and `valid` properties.
 - Completion criteria:
   - Existing signing/validation tests pass and new security regression tests fail on the old implementation but pass on the new implementation.
+- Verification evidence:
+  - `julia --project=. --startup-file=no -e 'using Pkg; Pkg.test()'` passed with 578 tests.
+  - `git diff --check` passed.
 
 ### [ ] ITEM-003 (P0) Replace MbedTLS with OpenSSL_jll-backed crypto
 - Description: MbedTLS is the current crypto backend and should be removed because it is not the desired maintenance/security posture.

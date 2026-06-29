@@ -6,7 +6,7 @@ using Base64
 using Downloads
 using Random
 
-import Base: show, isvalid
+import Base: getproperty, setproperty!, show, isvalid
 export JWT, JWK, JWKRSA, JWKSymmetric, JWKSet
 export issigned, isverified, isvalid
 export validate!, sign!, refresh!
@@ -61,27 +61,70 @@ JWT represents a JWT payload at the minimum.
 When signed, it holds the header and signature too.
 The parts are stored in encoded form.
 """
-mutable struct JWT
+struct JWTParts
     payload::String
     header::Union{Nothing,String}
     signature::Union{Nothing,String}
-    verified::Bool
-    valid::Union{Nothing,Bool}
+end
+
+mutable struct JWT
+    _parts::JWTParts
+    _verified::Bool
+    _valid::Union{Nothing,Bool}
 
     function JWT(; jwt::Union{Nothing,String}=nothing, payload=nothing)
         if jwt !== nothing
             (payload === nothing) || throw(ArgumentError("payload must be nothing if jwt is provided"))
-            parts = split(jwt, ".")
+            parts = split(jwt, "."; keepempty=true)
             if length(parts) == 3
-                new(parts[2], parts[1], parts[3], false, nothing)
+                new(JWTParts(parts[2], parts[1], parts[3]), false, nothing)
             else
-                new("", nothing, nothing, true, false)
+                new(JWTParts("", nothing, nothing), true, false)
             end
         else
             (payload !== nothing) || throw(ArgumentError("payload must be provided if jwt is not"))
-            new(isa(payload, String) ? payload : urlenc(base64encode(JSON.json(payload))), nothing, nothing, false, nothing)
+            encoded_payload = isa(payload, String) ? payload : urlenc(base64encode(JSON.json(payload)))
+            new(JWTParts(encoded_payload, nothing, nothing), false, nothing)
         end
     end
+end
+JWT(jwt::String) = JWT(; jwt=jwt)
+
+function getproperty(jwt::JWT, name::Symbol)
+    if name === :payload
+        return getfield(jwt, :_parts).payload
+    elseif name === :header
+        return getfield(jwt, :_parts).header
+    elseif name === :signature
+        return getfield(jwt, :_parts).signature
+    elseif name === :verified
+        return getfield(jwt, :_verified)
+    elseif name === :valid
+        return getfield(jwt, :_valid)
+    else
+        return getfield(jwt, name)
+    end
+end
+
+function setproperty!(jwt::JWT, name::Symbol, value)
+    if name in (:payload, :header, :signature, :verified, :valid)
+        throw(ArgumentError("JWT.$name is read-only"))
+    else
+        setfield!(jwt, name, value)
+    end
+end
+
+function setvalidation!(jwt::JWT, valid::Union{Nothing,Bool})
+    setfield!(jwt, :_verified, valid !== nothing)
+    setfield!(jwt, :_valid, valid)
+    return valid
+end
+
+function setparts!(jwt::JWT, parts::JWTParts; verified::Bool=false, valid::Union{Nothing,Bool}=nothing)
+    setfield!(jwt, :_parts, parts)
+    setfield!(jwt, :_verified, verified)
+    setfield!(jwt, :_valid, valid)
+    return jwt
 end
 
 decodepart(encoded::String) = JSON.parse(String(base64decode(urldec(encoded))))
@@ -111,9 +154,10 @@ Get the key id from the JWT header, or `nothing` if the `kid` parameter is not i
 
 The JWT must be signed. An exception is thrown otherwise.
 """
-function kid(jwt::JWT)::String
+function kid(jwt::JWT)::Union{Nothing,String}
     issigned(jwt) || throw(ArgumentError("jwt is not signed"))
-    get(decodepart(jwt.header), "kid", nothing)
+    value = get(decodepart(jwt.header), "kid", nothing)
+    value isa String ? value : nothing
 end
 
 """
@@ -123,9 +167,10 @@ Get the key algorithm from the JWT header, or `nothing` if the `alg` parameter i
 
 The JWT must be signed. An exception is thrown otherwise.
 """
-function alg(jwt::JWT)::String
+function alg(jwt::JWT)::Union{Nothing,String}
     issigned(jwt) || throw(ArgumentError("jwt is not signed"))
-    get(decodepart(jwt.header), "alg", nothing)
+    value = get(decodepart(jwt.header), "alg", nothing)
+    value isa String ? value : nothing
 end
 
 """
@@ -156,30 +201,35 @@ The optional `algorithms` parameter can be used to specify the algorithms to use
 
 Returns `true` if the JWT is valid, `false` otherwise.
 """
-validate!(jwt::JWT, keyset::JWKSet; algorithms::Vector{String}=String[]) = validate!(jwt, keyset, kid(jwt); algorithms=algorithms)
+function validate!(jwt::JWT, keyset::JWKSet; algorithms::Vector{String}=String[])
+    keyid = kid(jwt)
+    keyid === nothing && throw(ArgumentError("jwt header does not include kid"))
+    validate!(jwt, keyset, keyid; algorithms=algorithms)
+end
 function validate!(jwt::JWT, keyset::JWKSet, kid::String; algorithms::Vector{String}=String[])
-    isverified(jwt) && (return isvalid(jwt))
     (kid in keys(keyset.keys)) || refresh!(keyset)
     validate!(jwt, keyset.keys[kid]; algorithms=algorithms)
 end
 function validate!(jwt::JWT, key::JWK; algorithms::Vector{String}=String[])
-    isverified(jwt) && (return isvalid(jwt))
     issigned(jwt) || throw(ArgumentError("jwt is not signed"))
 
     data = jwt.header * "." * jwt.payload
-    sigbytes = base64decode(urldec(jwt.signature))
+    sigbytes = try
+        base64decode(urldec(jwt.signature))
+    catch
+        return setvalidation!(jwt, false)
+    end
 
-    jwt.verified = true
     # Check that the (optional) `alg` header claim matches the algorithm of the validation key
     alg_jwt = alg(jwt)
-    valid_alg = alg_jwt === nothing || alg_jwt == alg(key)
+    alg_jwt === nothing && return setvalidation!(jwt, false)
+    valid_alg = alg_jwt == alg(key)
     if !isempty(algorithms)
-        alg_matched = alg_jwt === nothing ? alg(key) : alg_jwt
-        if !(alg_matched in algorithms)
-            return false
+        if !(alg_jwt in algorithms)
+            return setvalidation!(jwt, false)
         end
     end
-    jwt.valid = valid_alg && if key isa JWKRSA
+    valid = valid_alg && if key isa JWKRSA
         try
             MbedTLS.verify(key.key, key.kind, MbedTLS.digest(key.kind, data), sigbytes) == 0
         catch
@@ -188,6 +238,7 @@ function validate!(jwt::JWT, key::JWK; algorithms::Vector{String}=String[])
     else
         MbedTLS.digest(key.kind, data, key.key) == sigbytes
     end
+    return setvalidation!(jwt, valid)
 end
 
 """
@@ -231,10 +282,7 @@ function sign!(jwt::JWT, key::JWK, kid::String="")
     sigbytes = key isa JWKRSA ?  MbedTLS.sign(key.key, key.kind, MbedTLS.digest(key.kind, data), MersenneTwister()) : MbedTLS.digest(key.kind, data, key.key)
     signature = urlenc(base64encode(sigbytes))
 
-    jwt.header = header
-    jwt.signature = signature
-    jwt.verified = true
-    jwt.valid = true
+    setparts!(jwt, JWTParts(jwt.payload, header, signature); verified=true, valid=true)
     nothing
 end
 
@@ -381,12 +429,12 @@ function with_valid_jwt(f::Function, jwt::JWT, keyset::JWKSet;
     algorithms::Vector{String}=String[],
 )
     if isnothing(kid)
-        validate!(jwt, keyset; algorithms=algorithms)
+        valid = validate!(jwt, keyset; algorithms=algorithms)
     else
-        validate!(jwt, keyset, kid; algorithms=algorithms)
+        valid = validate!(jwt, keyset, kid; algorithms=algorithms)
     end
 
-    isvalid(jwt) || throw(ArgumentError("invalid jwt"))
+    valid || throw(ArgumentError("invalid jwt"))
 
     return f(jwt)
 end
