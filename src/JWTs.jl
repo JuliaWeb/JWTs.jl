@@ -35,13 +35,37 @@ struct JWKRSA
     end
 end
 
+struct JWKEC
+    alg::String
+    key::OpenSSLKey
+    crv::String
+
+    function JWKEC(alg::AbstractString, key::OpenSSLKey, crv::AbstractString)
+        alg in EC_ALGORITHMS || throw(ArgumentError("unsupported EC key algorithm: $alg"))
+        alg == alg_for_curve(crv) || throw(ArgumentError("EC algorithm $alg does not match curve $crv"))
+        new(String(alg), key, String(crv))
+    end
+end
+
+struct JWKOKP
+    alg::String
+    key::OpenSSLKey
+    crv::String
+
+    function JWKOKP(alg::AbstractString, key::OpenSSLKey, crv::AbstractString)
+        alg in OKP_ALGORITHMS || throw(ArgumentError("unsupported OKP key algorithm: $alg"))
+        alg == alg_for_curve(crv) || throw(ArgumentError("OKP algorithm $alg does not match curve $crv"))
+        new(String(alg), key, String(crv))
+    end
+end
+
 """
 JWK represents a JWK Key (either for signing or verification).
 
-JWK can be either a JWKRSA or JWKSymmetric. A RSA key can
+JWK can be a JWKRSA, JWKEC, JWKOKP, or JWKSymmetric. An asymmetric key can
 represent either the public or private key.
 """
-const JWK = Union{JWKRSA,JWKSymmetric}
+const JWK = Union{JWKRSA,JWKEC,JWKOKP,JWKSymmetric}
 
 """
 JWKSet holds a set of keys, fetched from a OpenId key URL, each key identified by a key id.
@@ -190,11 +214,36 @@ end
 
 Get the key algorithm from the JWK key as a string.
 
-Supported algorithms are "RS256", "RS384", "RS512", "HS256", "HS384", and "HS512".
+Supported algorithms are "HS256", "HS384", "HS512", "RS256", "RS384", "RS512",
+"PS256", "PS384", "PS512", "ES256", "ES384", "ES512", and "EdDSA".
 An `ArgumentError` is thrown for unsupported algorithms.
 """
 function alg(key::JWK)
     return key.alg
+end
+
+function signbytes(key::JWK, data::AbstractString)
+    if key isa JWKSymmetric
+        return hmac_digest(alg(key), key.key, data)
+    elseif key isa JWKRSA
+        return sign_rsa(key.key, alg(key), data)
+    elseif key isa JWKEC
+        return sign_ec(key.key, alg(key), data)
+    else
+        return sign_okp(key.key, alg(key), data)
+    end
+end
+
+function verifybytes(key::JWK, data::AbstractString, signature::AbstractVector{UInt8})
+    if key isa JWKSymmetric
+        return constant_time_equal(hmac_digest(alg(key), key.key, data), signature)
+    elseif key isa JWKRSA
+        return verify_rsa(key.key, alg(key), data, signature)
+    elseif key isa JWKEC
+        return verify_ec(key.key, alg(key), data, signature)
+    else
+        return verify_okp(key.key, alg(key), data, signature)
+    end
 end
 
 show(io::IO, jwt::JWT) = print(io, issigned(jwt) ? join([jwt.header, jwt.payload, jwt.signature], '.') : jwt.payload)
@@ -237,14 +286,10 @@ function validate!(jwt::JWT, key::JWK; algorithms::Vector{String}=String[])
             return setvalidation!(jwt, false)
         end
     end
-    valid = valid_alg && if key isa JWKRSA
-        try
-            verify_rsa(key.key, alg(key), data, sigbytes)
-        catch
-            false
-        end
-    else
-        constant_time_equal(hmac_digest(alg(key), key.key, data), sigbytes)
+    valid = valid_alg && try
+        verifybytes(key, data, sigbytes)
+    catch
+        false
     end
     return setvalidation!(jwt, valid)
 end
@@ -287,7 +332,7 @@ function sign!(jwt::JWT, key::JWK, kid::String="")
     header = urlenc(base64encode(JSON.json(header_dict)))
 
     data = header * "." * jwt.payload
-    sigbytes = key isa JWKRSA ? sign_rsa(key.key, alg(key), data) : hmac_digest(alg(key), key.key, data)
+    sigbytes = signbytes(key, data)
     signature = urlenc(base64encode(sigbytes))
 
     setparts!(jwt, JWTParts(jwt.payload, header, signature); verified=true, valid=true)
@@ -339,22 +384,28 @@ function refresh!(keyseturl::String, keysetdict::Dict{String,JWK}; default_algs 
     refresh!(keys, keysetdict; default_algs=default_algs)
 end
 
+function default_jwk_alg(key, default_algs)
+    haskey(key, "alg") && return key["alg"]
+    kty = key["kty"]
+    if kty in ("EC", "OKP")
+        return alg_for_curve(key["crv"])
+    else
+        return get(default_algs, kty, "none")
+    end
+end
+
 function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"))
     for key in keys
         kid = key["kid"]
         kty = key["kty"]
-        alg = get(key, "alg", get(default_algs, kty, "none"))
+        alg = default_jwk_alg(key, default_algs)
 
         # ref: https://tools.ietf.org/html/rfc7518
         try
             if kty == "RSA"
                 n = base64decode(urldec(key["n"]))
                 e = base64decode(urldec(key["e"]))
-                if alg == "RS256"
-                    keysetdict[kid] = JWKRSA(alg, rsa_public_key(n, e))
-                elseif alg == "RS384"
-                    keysetdict[kid] = JWKRSA(alg, rsa_public_key(n, e))
-                elseif alg == "RS512"
+                if alg in RSA_ALGORITHMS
                     keysetdict[kid] = JWKRSA(alg, rsa_public_key(n, e))
                 else
                     @warn("key alg $alg not supported yet, skipping key $kid")
@@ -362,12 +413,27 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                 end
             elseif kty == "oct"
                 k = base64decode(urldec(key["k"]))
-                if alg == "HS256"
+                if alg in HMAC_ALGORITHMS
                     keysetdict[kid] = JWKSymmetric(alg, k)
-                elseif alg == "HS384"
-                    keysetdict[kid] = JWKSymmetric(alg, k)
-                elseif alg == "HS512"
-                    keysetdict[kid] = JWKSymmetric(alg, k)
+                else
+                    @warn("key alg $alg not supported yet, skipping key $kid")
+                    continue
+                end
+            elseif kty == "EC"
+                crv = key["crv"]
+                x = base64decode(urldec(key["x"]))
+                y = base64decode(urldec(key["y"]))
+                if alg in EC_ALGORITHMS
+                    keysetdict[kid] = JWKEC(alg, ec_public_key(crv, x, y), crv)
+                else
+                    @warn("key alg $alg not supported yet, skipping key $kid")
+                    continue
+                end
+            elseif kty == "OKP"
+                crv = key["crv"]
+                x = base64decode(urldec(key["x"]))
+                if alg in OKP_ALGORITHMS
+                    keysetdict[kid] = JWKOKP(alg, okp_public_key(crv, x), crv)
                 else
                     @warn("key alg $alg not supported yet, skipping key $kid")
                     continue

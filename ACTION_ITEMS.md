@@ -77,7 +77,7 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
   - `git diff --check` passed.
   - `rg -n "MbedTLS" Project.toml src test README.md` returned no matches.
 
-### [ ] ITEM-004 (P1) Add modern JOSE algorithm support
+### [x] ITEM-004 (P1) Add modern JOSE algorithm support
 - Description: JWTs.jl only supports HS* and RS* today; industry-standard JWT libraries usually support PS*, ES*, and EdDSA as well.
 - Desired outcome: Add verify/sign support for PS256/PS384/PS512, ES256/ES384/ES512, and EdDSA/Ed25519, including JWK parsing for RSA, EC, and OKP keys.
 - Affected files: `src/JWTs.jl`, crypto backend files under `src/`, `test/runtests.jl`, new key fixtures under `test/keys/`
@@ -93,8 +93,15 @@ Make JWTs.jl a production-grade, industry-standard JWT/JWS package while keeping
   - `git diff --check`
 - Assumptions:
   - `EdDSA` maps to Ed25519 initially; Ed448 can be evaluated separately if OpenSSL_jll support and test vectors are straightforward.
+  - PS* support should use RSA-PSS salt length equal to the digest length, matching JOSE expectations.
+  - ES* support must convert between OpenSSL DER ECDSA signatures and JOSE raw `R || S` signatures at the JWT boundary.
+  - Test fixtures may be generated with local OpenSSL/Python cryptography tooling, but runtime code must use OpenSSL_jll directly and not shell out.
 - Completion criteria:
   - All newly supported algorithms have positive, wrong-key, wrong-algorithm, tampered-signature, and malformed-key tests.
+- Verification evidence:
+  - `julia --project=. --startup-file=no -e 'using Pkg; Pkg.test()'` passed with 1990 tests.
+  - `git diff --check` passed.
+  - `rg -n "MbedTLS" Project.toml src test README.md` returned no matches.
 
 ### [ ] ITEM-005 (P1) Add verifier options, verified result, and registered claim validation
 - Description: JWTs.jl validates signatures but not standard JWT claims like `exp`, `nbf`, `iat`, `iss`, `aud`, `sub`, `jti`, or `nonce`.

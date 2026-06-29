@@ -70,6 +70,25 @@ function test_in_mem_keyset(template)
     end
 end
 
+function tamper_signature(jwt::JWT)
+    sig = base64decode(JWTs.urldec(jwt.signature))
+    sig[1] = xor(sig[1], 0x01)
+    JWT(; jwt=join([jwt.header, jwt.payload, JWTs.urlenc(base64encode(sig))], "."))
+end
+
+function signing_jwk(public_jwk, keyfile)
+    key = JWTs.parse_keyfile(keyfile)
+    if public_jwk isa JWKRSA
+        return JWKRSA(JWTs.alg(public_jwk), key)
+    elseif public_jwk isa JWTs.JWKEC
+        return JWTs.JWKEC(JWTs.alg(public_jwk), key, public_jwk.crv)
+    elseif public_jwk isa JWTs.JWKOKP
+        return JWTs.JWKOKP(JWTs.alg(public_jwk), key, public_jwk.crv)
+    else
+        throw(ArgumentError("unsupported asymmetric JWK type $(typeof(public_jwk))"))
+    end
+end
+
 function test_signing_keys(keyset, signingkeyset, algorithms::Vector{String})
     for k in keys(keyset.keys)
         for d in test_payload_data
@@ -106,6 +125,7 @@ function test_signing_keys(keyset, signingkeyset, algorithms::Vector{String})
             @test isverified(jwt)
             @test !isvalid(jwt)
             @test validate!(jwt, keyset, k; algorithms=algorithms)
+            @test !validate!(tamper_signature(jwt), keyset, k; algorithms=algorithms)
 
             # test with invalid algos
             jwt_check = JWT(; jwt=string(jwt))
@@ -135,6 +155,14 @@ function test_signing_keys(keyset, signingkeyset, algorithms::Vector{String})
             @test validate!(jwt, keyset, k; algorithms=algorithms)
             @test !validate!(jwt, keyset, invalidkey; algorithms=algorithms)
             @test validate!(jwt, keyset, k; algorithms=algorithms)
+
+            same_alg_invalidkey = findfirst(x -> x != keyset.keys[k] && JWTs.alg(x) == JWTs.alg(keyset.keys[k]), keyset.keys)
+            if same_alg_invalidkey !== nothing
+                jwt3 = JWT(; jwt=string(jwt))
+                @test !validate!(jwt3, keyset, same_alg_invalidkey; algorithms=[JWTs.alg(keyset.keys[k])])
+                @test isverified(jwt3)
+                @test !isvalid(jwt3)
+            end
         end
     end
 end
@@ -149,7 +177,7 @@ function test_signing_asymmetric_keys(keyset_url, algorithms::Vector{String})
         if startswith(keyfile, "file://")
             keyfile = keyfile[8:end]
         end
-        signingkeyset.keys[k] = JWKRSA(JWTs.alg(signingkeyset.keys[k]), JWTs.parse_keyfile(keyfile))
+        signingkeyset.keys[k] = signing_jwk(signingkeyset.keys[k], keyfile)
     end
     test_signing_keys(keyset, signingkeyset, algorithms)
 end
@@ -233,6 +261,9 @@ end
         test_signing_symmetric_keys("file://" * joinpath(@__DIR__, "keys", "oct", "jwkkey.json"), ["HS256", "HS384", "HS512"])
         test_in_mem_keyset(joinpath(@__DIR__, "keys", "oct", "jwkkey.json"))
         test_signing_asymmetric_keys("file://" * joinpath(@__DIR__, "keys", "rsa", "jwkkey.json"), ["RS256"])
+        test_signing_asymmetric_keys("file://" * joinpath(@__DIR__, "keys", "rsa_ps", "jwkkey.json"), ["PS256", "PS384", "PS512"])
+        test_signing_asymmetric_keys("file://" * joinpath(@__DIR__, "keys", "ec", "jwkkey.json"), ["ES256", "ES384", "ES512"])
+        test_signing_asymmetric_keys("file://" * joinpath(@__DIR__, "keys", "okp", "jwkkey.json"), ["EdDSA"])
         test_with_valid_jwt("file://" * joinpath(@__DIR__, "keys", "oct", "jwkkey.json"), ["HS256", "HS384", "HS512"])
         test_validation_state_safety("file://" * joinpath(@__DIR__, "keys", "oct", "jwkkey.json"))
     end
@@ -249,5 +280,39 @@ end
 
         @test_throws ArgumentError JWKRSA("RS1024", rsakey)
         @test_throws ArgumentError JWKSymmetric("HS1024", UInt8[])
+
+        eckey = JWTs.parse_keyfile(joinpath(@__DIR__, "keys", "ec", "es256-1.private.pem"))
+        @test JWTs.alg(JWTs.JWKEC("ES256", eckey, "P-256")) == "ES256"
+        @test_throws ArgumentError JWTs.JWKEC("ES384", eckey, "P-256")
+
+        okpkey = JWTs.parse_keyfile(joinpath(@__DIR__, "keys", "okp", "eddsa-1.private.pem"))
+        @test JWTs.alg(JWTs.JWKOKP("EdDSA", okpkey, "Ed25519")) == "EdDSA"
+        @test_throws ArgumentError JWTs.JWKOKP("EdDSA", okpkey, "Ed448")
+    end
+
+    @testset "malformed jwks" begin
+        keysetdict = Dict{String,JWK}()
+        bad_ec = [Dict(
+            "kid" => "bad-ec",
+            "kty" => "EC",
+            "alg" => "ES256",
+            "use" => "sig",
+            "crv" => "P-256",
+            "x" => JWTs.urlenc(base64encode(UInt8[0x01])),
+            "y" => JWTs.urlenc(base64encode(UInt8[0x02])),
+        )]
+        JWTs.refresh!(bad_ec, keysetdict)
+        @test isempty(keysetdict)
+
+        bad_okp = [Dict(
+            "kid" => "bad-okp",
+            "kty" => "OKP",
+            "alg" => "EdDSA",
+            "use" => "sig",
+            "crv" => "Ed25519",
+            "x" => JWTs.urlenc(base64encode(UInt8[0x01])),
+        )]
+        JWTs.refresh!(bad_okp, keysetdict)
+        @test isempty(keysetdict)
     end
 end
