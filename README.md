@@ -30,7 +30,7 @@ Asymmetric crypto uses OpenSSL through OpenSSL_jll. HMAC uses SHA.jl.
 
 ## Keys
 
-`JWTs.JWKSet` stores keys by `kid`. It can be created from a JWKS URL, a `file://` URL, or an in-memory vector of parsed JWK dictionaries. JWKS parsing supports public RSA, EC, OKP/Ed25519, and symmetric HMAC keys.
+`JWTs.JWKSet` stores keys by `kid`. It can be created from a JWKS URL, a `file://` URL, or an in-memory vector of parsed JWK dictionaries. JWKS parsing supports public RSA, EC, OKP/Ed25519, and symmetric HMAC keys. Symmetric keys are accepted from local files and in-memory key sets; http(s) JWKS refreshes reject them by default because remote provider JWKS endpoints should publish only public keys.
 
 ```julia
 using JWTs
@@ -150,7 +150,7 @@ fetcher = url -> read("fixtures/jwks.json", String)
 verifier = JWTs.Verifier(; jwks_uri="https://issuer.example/keys", algorithms=["RS256"], fetcher=fetcher)
 ```
 
-The default fetcher uses Downloads.jl. Pass `downloader=Downloads.Downloader()` when you want to reuse a configured Downloads downloader, or pass `fetcher=url -> ...` when tests or applications need full control over network access.
+The default fetcher uses Downloads.jl. Pass `downloader=Downloads.Downloader()` when you want to reuse a configured Downloads downloader, or pass `fetcher=url -> ...` when tests or applications need full control over network access. The same keywords are available on `JWTs.refresh!(keyset)` for direct `JWKSet` refreshes.
 
 ## OpenID Connect Discovery
 
@@ -215,6 +215,7 @@ end
 - Validate `iss` and `aud` for tokens accepted at service boundaries.
 - Use `nonce` for ID-token replay protection when your protocol requires it.
 - Keep key fetchers restricted to trusted issuer URLs.
+- Do not accept symmetric `oct` keys from third-party JWKS endpoints.
 
 ## Migration Notes
 

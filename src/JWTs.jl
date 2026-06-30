@@ -427,18 +427,30 @@ If the keyseturl is not specified, the keyset is refreshed with the keys from th
 The default algorithm values are referred to only if the keyset does not specify the exact algorithm type.
 E.g. if only "RSA" is specified as the algorithm, "RS256" will be assumed.
 """
-function refresh!(keyset::JWKSet, keyseturl::String; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing)
+function refresh!(keyset::JWKSet, keyseturl::String; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing, fetcher=nothing, allow_symmetric=nothing)
     keyset.url = keyseturl
-    refresh!(keyset; default_algs=default_algs, downloader=downloader)
+    refresh!(keyset; default_algs=default_algs, downloader=downloader, fetcher=fetcher, allow_symmetric=allow_symmetric)
 end
 
-function refresh!(keyset::JWKSet; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing)
+function refresh!(keyset::JWKSet; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing, fetcher=nothing, allow_symmetric=nothing)
     if !isempty(keyset.url)
         keys = Dict{String,JWK}()
-        refresh!(keyset.url, keys; default_algs=default_algs, downloader=downloader)
+        refresh!(keyset.url, keys; default_algs=default_algs, downloader=downloader, fetcher=fetcher, allow_symmetric=allow_symmetric)
         keyset.keys = keys
     end
     nothing
+end
+
+function jwks_document(raw, url::String)
+    if raw isa AbstractDict
+        return raw
+    elseif raw isa AbstractString
+        return JSON.parse(String(raw))
+    elseif raw isa AbstractVector{UInt8}
+        return JSON.parse(String(raw))
+    else
+        throw(ArgumentError("unsupported JWKS document result from $url: $(typeof(raw))"))
+    end
 end
 
 function fetch_url(url::String; downloader=nothing)
@@ -456,10 +468,11 @@ function fetch_url(url::String; downloader=nothing)
     end
 end
 
-function refresh!(keyseturl::String, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing)
-    jstr = fetch_url(keyseturl; downloader=downloader)
-    keys = JSON.parse(jstr)["keys"]
-    refresh!(keys, keysetdict; default_algs=default_algs)
+function refresh!(keyseturl::String, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing, fetcher=nothing, allow_symmetric=nothing)
+    raw = fetcher === nothing ? fetch_url(keyseturl; downloader=downloader) : fetcher(keyseturl)
+    keys = jwks_document(raw, keyseturl)["keys"]
+    allow_symmetric = something(allow_symmetric, !is_http_url(keyseturl))
+    refresh!(keys, keysetdict; default_algs=default_algs, allow_symmetric=allow_symmetric)
 end
 
 function default_jwk_alg(key, default_algs)
@@ -577,10 +590,19 @@ base64url_encode(data::AbstractString)::String = base64url_encode(collect(codeun
 
 function base64url_decode(data::AbstractString)::Vector{UInt8}
     bytes = codeunits(data)
-    n = length(bytes)
-    # Tolerate, but do not require, trailing '=' padding; reject '=' anywhere else.
-    while n > 0 && bytes[n] == UInt8('=')
-        n -= 1
+    byte_len = length(bytes)
+    n = byte_len
+    # Tolerate canonical trailing '=' padding, but reject excess or interior padding.
+    padding_start = findfirst(==(UInt8('=')), bytes)
+    if padding_start !== nothing
+        for i in padding_start:byte_len
+            bytes[i] == UInt8('=') || throw(ArgumentError("invalid base64url padding"))
+        end
+        n = padding_start - 1
+        padding_count = byte_len - n
+        remainder = n % 4
+        expected_padding = remainder == 0 ? 0 : 4 - remainder
+        padding_count == expected_padding || throw(ArgumentError("invalid base64url padding"))
     end
     out = UInt8[]
     sizehint!(out, (n * 3) >>> 2)

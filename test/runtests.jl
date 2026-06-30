@@ -649,9 +649,14 @@ end
     @testset "hardening" begin
         # strict base64url decoding: canonical round-trips, everything else is rejected
         @test JWTs.base64url_decode(JWTs.base64url_encode(UInt8[0x00, 0x01, 0xfe, 0xff])) == UInt8[0x00, 0x01, 0xfe, 0xff]
+        @test JWTs.base64url_decode("YQ==") == UInt8[0x61] # canonical padded base64url is accepted
         @test_throws ArgumentError JWTs.base64url_decode("ab+c")   # standard-base64 '+'
         @test_throws ArgumentError JWTs.base64url_decode("ab/c")   # standard-base64 '/'
         @test_throws ArgumentError JWTs.base64url_decode("YQ=x")   # '=' before the end
+        @test_throws ArgumentError JWTs.base64url_decode("AA=")    # wrong padding count
+        @test_throws ArgumentError JWTs.base64url_decode("AA===")  # excess trailing padding
+        @test_throws ArgumentError JWTs.base64url_decode("AAA==")  # excess trailing padding
+        @test_throws ArgumentError JWTs.base64url_decode("YQ===")  # excess trailing padding
         @test_throws ArgumentError JWTs.base64url_decode("YQABC")  # length % 4 == 1
         @test_throws ArgumentError JWTs.base64url_decode("QB")     # non-zero trailing bits
 
@@ -666,6 +671,14 @@ end
         sym_jwt = JWT(; payload=Dict("sub" => "x"))
         sign!(sym_jwt, JWKSymmetric("HS256", secret), "sym1")
         @test_throws JWTs.JWKSError verify(sym_verifier, sym_jwt)
+
+        direct_remote_keyset = JWKSet("https://issuer.example/keys")
+        refresh!(direct_remote_keyset; fetcher=(_ -> JSON.json(sym_doc)))
+        @test isempty(direct_remote_keyset.keys)
+
+        direct_trusted_keyset = JWKSet("https://issuer.example/keys")
+        refresh!(direct_trusted_keyset; fetcher=(_ -> JSON.json(sym_doc)), allow_symmetric=true)
+        @test haskey(direct_trusted_keyset.keys, "sym1")
 
         # OIDC discovery must carry an issuer and an http(s) jwks_uri
         oidc_issuer = "https://issuer.example/oauth2/default"
