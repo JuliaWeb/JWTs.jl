@@ -1,7 +1,7 @@
 const VerifierKeySource = Union{JWKSet,RemoteJWKSet,OIDCDiscovery}
 
-struct Verifier
-    keyset::VerifierKeySource
+struct Verifier{S<:VerifierKeySource,N}
+    keyset::S
     algorithms::Vector{String}
     issuer::Union{Nothing,String}
     audiences::Union{Nothing,Vector{String}}
@@ -11,16 +11,16 @@ struct Verifier
     leeway::Float64
     max_age::Union{Nothing,Float64}
     required_claims::Vector{String}
-    now::Any
+    now::N
 end
 
-struct VerifiedJWT
+struct VerifiedJWT{H<:AbstractDict{String},C<:AbstractDict{String},K<:JWK}
     token::JWT
-    header::Dict{String,Any}
-    claims::Dict{String,Any}
+    header::H
+    claims::C
     kid::String
     alg::String
-    key::JWK
+    key::K
 end
 
 claims(jwt::VerifiedJWT) = jwt.claims
@@ -51,8 +51,8 @@ function Verifier(
     leeway::Real=0,
     max_age::Union{Nothing,Real}=nothing,
     required_claims=String[],
-    now=time,
-)
+    now::N=time,
+) where {N}
     algorithms === nothing && throw(ArgumentError("Verifier requires an explicit algorithms allowlist"))
     algs = String[String(alg) for alg in algorithms]
     isempty(algs) && throw(ArgumentError("Verifier requires a non-empty algorithms allowlist"))
@@ -85,12 +85,19 @@ function Verifier(
     jwks_ttl::Real=300,
     refresh_cooldown::Real=30,
     default_algs=DEFAULT_JWK_ALGS,
-    fetcher=nothing,
-    downloader=nothing,
-    now=time,
-    kwargs...
-)
-    issuer_s = rstrip(String(issuer_url), '/')
+    fetcher::F=nothing,
+    downloader::D=nothing,
+    now::N=time,
+    algorithms=nothing,
+    audience=nothing,
+    subject::Union{Nothing,AbstractString}=nothing,
+    jwtid::Union{Nothing,AbstractString}=nothing,
+    nonce::Union{Nothing,AbstractString}=nothing,
+    leeway::Real=0,
+    max_age::Union{Nothing,Real}=nothing,
+    required_claims=String[],
+) where {F,D,N}
+    issuer_s = String(rstrip(String(issuer_url), '/'))
     source = OIDCDiscovery(
         issuer_s;
         discovery_path=discovery_path,
@@ -102,7 +109,19 @@ function Verifier(
         downloader=downloader,
         now=now,
     )
-    return Verifier(source; issuer=issuer_s, now=now, kwargs...)
+    return Verifier(
+        source;
+        algorithms=algorithms,
+        issuer=issuer_s,
+        audience=audience,
+        subject=subject,
+        jwtid=jwtid,
+        nonce=nonce,
+        leeway=leeway,
+        max_age=max_age,
+        required_claims=required_claims,
+        now=now,
+    )
 end
 
 function Verifier(;
@@ -110,11 +129,19 @@ function Verifier(;
     jwks_ttl::Real=300,
     refresh_cooldown::Real=30,
     default_algs=DEFAULT_JWK_ALGS,
-    fetcher=nothing,
-    downloader=nothing,
-    now=time,
-    kwargs...
-)
+    fetcher::F=nothing,
+    downloader::D=nothing,
+    now::N=time,
+    algorithms=nothing,
+    issuer::Union{Nothing,AbstractString}=nothing,
+    audience=nothing,
+    subject::Union{Nothing,AbstractString}=nothing,
+    jwtid::Union{Nothing,AbstractString}=nothing,
+    nonce::Union{Nothing,AbstractString}=nothing,
+    leeway::Real=0,
+    max_age::Union{Nothing,Real}=nothing,
+    required_claims=String[],
+) where {F,D,N}
     jwks_uri === nothing && throw(ArgumentError("Verifier requires a JWKSet, key vector, OIDC issuer, or jwks_uri"))
     source = RemoteJWKSet(
         jwks_uri;
@@ -125,29 +152,44 @@ function Verifier(;
         downloader=downloader,
         now=now,
     )
-    return Verifier(source; now=now, kwargs...)
+    return Verifier(
+        source;
+        algorithms=algorithms,
+        issuer=issuer,
+        audience=audience,
+        subject=subject,
+        jwtid=jwtid,
+        nonce=nonce,
+        leeway=leeway,
+        max_age=max_age,
+        required_claims=required_claims,
+        now=now,
+    )
 end
 
 function claim_number(claimset, name::String)
     value = get(claimset, name, nothing)
-    value isa Real || throw(JWTClaimError(:claim_type, "jwt claim $name must be numeric"))
-    return Float64(value)
+    value isa Int64 && return Float64(value)
+    value isa Float64 && return value
+    throw(JWTClaimError(:claim_type, "jwt claim $name must be numeric"))
 end
 
 function claim_string(claimset, name::String)
     value = get(claimset, name, nothing)
-    value isa AbstractString || throw(JWTClaimError(:claim_type, "jwt claim $name must be a string"))
-    return String(value)
+    value isa String && return value
+    throw(JWTClaimError(:claim_type, "jwt claim $name must be a string"))
 end
 
 function claim_audiences(claimset)
     value = get(claimset, "aud", nothing)
-    value isa AbstractString && return String[String(value)]
-    if value isa AbstractVector
+    value isa String && return String[value]
+    if value isa Vector{String}
+        return copy(value)
+    elseif value isa Vector{Any}
         audiences = String[]
         for aud in value
-            aud isa AbstractString || throw(JWTClaimError(:claim_type, "jwt claim aud entries must be strings"))
-            push!(audiences, String(aud))
+            aud isa String || throw(JWTClaimError(:claim_type, "jwt claim aud entries must be strings"))
+            push!(audiences, aud)
         end
         return audiences
     end
@@ -207,7 +249,7 @@ verify(verifier::Verifier, jwt::String) = verify(verifier, JWT(jwt))
 
 function verify(verifier::Verifier, jwt::JWT)
     issigned(jwt) || throw(JWTVerificationError(:token_unsigned, "jwt is not signed"))
-    header = decodepart(jwt.header)
+    header = decode_jwt_json_object(jwt.header)
     header_alg = alg(jwt)
     header_alg === nothing && throw(JWTVerificationError(:algorithm_missing, "jwt header does not include alg"))
     header_alg in verifier.algorithms || throw(JWTVerificationError(:algorithm_disallowed, "jwt algorithm is not allowed"))
@@ -216,7 +258,7 @@ function verify(verifier::Verifier, jwt::JWT)
     key = resolve_verification_key(verifier.keyset, header_kid)
     valid = validate!(jwt, key; algorithms=verifier.algorithms)
     valid || throw(JWTVerificationError(:signature_invalid, "invalid jwt signature"))
-    claimset = claims(jwt)
+    claimset = decode_jwt_json_object(jwt.payload)
     validate_claims!(claimset, verifier, verifier.now())
     return VerifiedJWT(jwt, header, claimset, header_kid, header_alg, key)
 end

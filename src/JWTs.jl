@@ -1,7 +1,6 @@
 module JWTs
 
 using JSON
-using Base64
 using Downloads
 using OpenSSL_jll
 using SHA
@@ -121,7 +120,7 @@ mutable struct JWT
             end
         else
             (payload !== nothing) || throw(ArgumentError("payload must be provided if jwt is not"))
-            encoded_payload = isa(payload, String) ? payload : urlenc(base64encode(JSON.json(payload)))
+            encoded_payload = isa(payload, String) ? payload : base64url_encode(JSON.json(payload))
             new(JWTParts(encoded_payload, nothing, nothing), false, nothing)
         end
     end
@@ -165,7 +164,392 @@ function setparts!(jwt::JWT, parts::JWTParts; verified::Bool=false, valid::Union
     return jwt
 end
 
-decodepart(encoded::String) = JSON.parse(String(base64decode(urldec(encoded))))
+decodepart(encoded::String) = JSON.parse(String(base64url_decode(encoded)))
+
+function json_skip_ws(bytes, i::Int, last_i::Int)::Int
+    while i <= last_i
+        c = bytes[i]
+        if c == UInt8(' ') || c == UInt8('\t') || c == UInt8('\n') || c == UInt8('\r')
+            i += 1
+        else
+            break
+        end
+    end
+    return i
+end
+
+function json_append_segment!(out::Vector{UInt8}, bytes, first_i::Int, last_i::Int)::Nothing
+    i = first_i
+    while i <= last_i
+        push!(out, bytes[i])
+        i += 1
+    end
+    return nothing
+end
+
+function json_hex_value(c::UInt8)::Int
+    UInt8('0') <= c <= UInt8('9') && return Int(c - UInt8('0'))
+    UInt8('a') <= c <= UInt8('f') && return Int(c - UInt8('a') + 10)
+    UInt8('A') <= c <= UInt8('F') && return Int(c - UInt8('A') + 10)
+    return -1
+end
+
+function json_parse_unicode_escape(bytes, i::Int, last_i::Int)::Tuple{Int,Int}
+    value = 0
+    for _ = 1:4
+        i <= last_i || throw(ArgumentError("unterminated JSON unicode escape"))
+        digit = json_hex_value(bytes[i])
+        digit >= 0 || throw(ArgumentError("invalid JSON unicode escape"))
+        value = (value << 4) + digit
+        i += 1
+    end
+    return value, i
+end
+
+function json_append_codepoint!(out::Vector{UInt8}, codepoint::Int)::Nothing
+    append!(out, codeunits(string(Char(codepoint))))
+    return nothing
+end
+
+function json_parse_string(bytes, i::Int, last_i::Int)::Tuple{String,Int}
+    i <= last_i && bytes[i] == UInt8('"') || throw(ArgumentError("expected JSON string"))
+    i += 1
+    segment_start = i
+    out = UInt8[]
+    while i <= last_i
+        c = bytes[i]
+        if c == UInt8('"')
+            json_append_segment!(out, bytes, segment_start, i - 1)
+            return String(out), i + 1
+        elseif c == UInt8('\\')
+            json_append_segment!(out, bytes, segment_start, i - 1)
+            i += 1
+            i <= last_i || throw(ArgumentError("unterminated JSON escape"))
+            esc = bytes[i]
+            if esc == UInt8('"') || esc == UInt8('\\') || esc == UInt8('/')
+                push!(out, esc)
+                i += 1
+            elseif esc == UInt8('b')
+                push!(out, 0x08)
+                i += 1
+            elseif esc == UInt8('f')
+                push!(out, 0x0c)
+                i += 1
+            elseif esc == UInt8('n')
+                push!(out, UInt8('\n'))
+                i += 1
+            elseif esc == UInt8('r')
+                push!(out, UInt8('\r'))
+                i += 1
+            elseif esc == UInt8('t')
+                push!(out, UInt8('\t'))
+                i += 1
+            elseif esc == UInt8('u')
+                codepoint, i = json_parse_unicode_escape(bytes, i + 1, last_i)
+                if 0xd800 <= codepoint <= 0xdbff
+                    i + 1 <= last_i && bytes[i] == UInt8('\\') && bytes[i + 1] == UInt8('u') ||
+                        throw(ArgumentError("invalid JSON surrogate pair"))
+                    low, i = json_parse_unicode_escape(bytes, i + 2, last_i)
+                    0xdc00 <= low <= 0xdfff || throw(ArgumentError("invalid JSON surrogate pair"))
+                    codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00)
+                elseif 0xdc00 <= codepoint <= 0xdfff
+                    throw(ArgumentError("invalid JSON surrogate pair"))
+                end
+                json_append_codepoint!(out, codepoint)
+            else
+                throw(ArgumentError("invalid JSON escape"))
+            end
+            segment_start = i
+        elseif c < 0x20
+            throw(ArgumentError("invalid JSON string control character"))
+        else
+            i += 1
+        end
+    end
+    throw(ArgumentError("unterminated JSON string"))
+end
+
+function json_skip_string(bytes, i::Int, last_i::Int)::Int
+    i <= last_i && bytes[i] == UInt8('"') || throw(ArgumentError("expected JSON string"))
+    i += 1
+    while i <= last_i
+        c = bytes[i]
+        if c == UInt8('"')
+            return i + 1
+        elseif c == UInt8('\\')
+            i += 2
+        elseif c < 0x20
+            throw(ArgumentError("invalid JSON string control character"))
+        else
+            i += 1
+        end
+    end
+    throw(ArgumentError("unterminated JSON string"))
+end
+
+function json_skip_value(bytes, i::Int, last_i::Int)::Int
+    i = json_skip_ws(bytes, i, last_i)
+    i <= last_i || throw(ArgumentError("expected JSON value"))
+    c = bytes[i]
+    if c == UInt8('"')
+        return json_skip_string(bytes, i, last_i)
+    elseif c == UInt8('{') || c == UInt8('[')
+        depth = 1
+        i += 1
+        while i <= last_i
+            c = bytes[i]
+            if c == UInt8('"')
+                i = json_skip_string(bytes, i, last_i)
+            elseif c == UInt8('{') || c == UInt8('[')
+                depth += 1
+                i += 1
+            elseif c == UInt8('}') || c == UInt8(']')
+                depth -= 1
+                i += 1
+                depth == 0 && return i
+            else
+                i += 1
+            end
+        end
+        throw(ArgumentError("unterminated JSON container"))
+    else
+        while i <= last_i
+            c = bytes[i]
+            (c == UInt8(',') || c == UInt8('}') || c == UInt8(']')) && return i
+            i += 1
+        end
+        return i
+    end
+end
+
+function jwt_header_string_claim(encoded::String, claim::String)::Union{Nothing,String}
+    json = String(base64url_decode(encoded))
+    bytes = codeunits(json)
+    last_i = ncodeunits(json)
+    i = json_skip_ws(bytes, 1, last_i)
+    i <= last_i && bytes[i] == UInt8('{') || throw(ArgumentError("jwt header must be a JSON object"))
+    i += 1
+    found::Union{Nothing,String} = nothing
+    while true
+        i = json_skip_ws(bytes, i, last_i)
+        i <= last_i || throw(ArgumentError("unterminated jwt header"))
+        if bytes[i] == UInt8('}')
+            i = json_skip_ws(bytes, i + 1, last_i)
+            i > last_i || throw(ArgumentError("trailing data after jwt header"))
+            return found
+        end
+        key, i = json_parse_string(bytes, i, last_i)
+        i = json_skip_ws(bytes, i, last_i)
+        i <= last_i && bytes[i] == UInt8(':') || throw(ArgumentError("expected ':' in jwt header"))
+        i = json_skip_ws(bytes, i + 1, last_i)
+        if key == claim
+            if i <= last_i && bytes[i] == UInt8('"')
+                found, i = json_parse_string(bytes, i, last_i)
+            else
+                found = nothing
+                i = json_skip_value(bytes, i, last_i)
+            end
+        else
+            i = json_skip_value(bytes, i, last_i)
+        end
+        i = json_skip_ws(bytes, i, last_i)
+        i <= last_i || throw(ArgumentError("unterminated jwt header"))
+        if bytes[i] == UInt8(',')
+            i += 1
+        elseif bytes[i] == UInt8('}')
+            i = json_skip_ws(bytes, i + 1, last_i)
+            i > last_i || throw(ArgumentError("trailing data after jwt header"))
+            return found
+        else
+            throw(ArgumentError("expected ',' or '}' in jwt header"))
+        end
+    end
+end
+
+const JWTDecodedValue = Union{Nothing,Bool,Int64,Float64,String,Vector{Any},Dict{String,Any}}
+
+function json_consume_literal(bytes, i::Int, last_i::Int, literal::String)::Int
+    for c in codeunits(literal)
+        i <= last_i && bytes[i] == c || throw(ArgumentError("invalid JSON literal"))
+        i += 1
+    end
+    return i
+end
+
+function json_parse_number(bytes, i::Int, last_i::Int)::Tuple{Union{Int64,Float64},Int}
+    negative = false
+    if i <= last_i && bytes[i] == UInt8('-')
+        negative = true
+        i += 1
+    end
+
+    i <= last_i || throw(ArgumentError("expected JSON number"))
+    int_value = Int64(0)
+    digits = 0
+    if bytes[i] == UInt8('0')
+        digits = 1
+        i += 1
+    elseif UInt8('1') <= bytes[i] <= UInt8('9')
+        while i <= last_i && UInt8('0') <= bytes[i] <= UInt8('9')
+            int_value = int_value * 10 + Int64(bytes[i] - UInt8('0'))
+            digits += 1
+            i += 1
+        end
+    else
+        throw(ArgumentError("expected JSON number"))
+    end
+    digits > 0 || throw(ArgumentError("expected JSON number"))
+
+    is_float = false
+    float_value = Float64(int_value)
+    if i <= last_i && bytes[i] == UInt8('.')
+        is_float = true
+        i += 1
+        i <= last_i && UInt8('0') <= bytes[i] <= UInt8('9') || throw(ArgumentError("expected JSON fraction digit"))
+        scale = 0.1
+        while i <= last_i && UInt8('0') <= bytes[i] <= UInt8('9')
+            float_value += Float64(bytes[i] - UInt8('0')) * scale
+            scale *= 0.1
+            i += 1
+        end
+    end
+
+    if i <= last_i && (bytes[i] == UInt8('e') || bytes[i] == UInt8('E'))
+        is_float = true
+        i += 1
+        exp_negative = false
+        if i <= last_i && (bytes[i] == UInt8('+') || bytes[i] == UInt8('-'))
+            exp_negative = bytes[i] == UInt8('-')
+            i += 1
+        end
+        i <= last_i && UInt8('0') <= bytes[i] <= UInt8('9') || throw(ArgumentError("expected JSON exponent digit"))
+        exponent = 0
+        while i <= last_i && UInt8('0') <= bytes[i] <= UInt8('9')
+            exponent = exponent * 10 + Int(bytes[i] - UInt8('0'))
+            i += 1
+        end
+        float_value *= 10.0 ^ (exp_negative ? -exponent : exponent)
+    end
+
+    if is_float
+        return negative ? -float_value : float_value, i
+    else
+        return negative ? -int_value : int_value, i
+    end
+end
+
+function json_parse_array(bytes, i::Int, last_i::Int)::Tuple{Vector{Any},Int}
+    i <= last_i && bytes[i] == UInt8('[') || throw(ArgumentError("expected JSON array"))
+    i += 1
+    values = Any[]
+    while true
+        i = json_skip_ws(bytes, i, last_i)
+        i <= last_i || throw(ArgumentError("unterminated JSON array"))
+        if bytes[i] == UInt8(']')
+            return values, i + 1
+        end
+        value, i = json_parse_value(bytes, i, last_i)
+        push!(values, value)
+        i = json_skip_ws(bytes, i, last_i)
+        i <= last_i || throw(ArgumentError("unterminated JSON array"))
+        if bytes[i] == UInt8(',')
+            i += 1
+        elseif bytes[i] == UInt8(']')
+            return values, i + 1
+        else
+            throw(ArgumentError("expected ',' or ']' in JSON array"))
+        end
+    end
+end
+
+function json_parse_object_any(bytes, i::Int, last_i::Int)::Tuple{Dict{String,Any},Int}
+    i <= last_i && bytes[i] == UInt8('{') || throw(ArgumentError("expected JSON object"))
+    i += 1
+    obj = Dict{String,Any}()
+    while true
+        i = json_skip_ws(bytes, i, last_i)
+        i <= last_i || throw(ArgumentError("unterminated JSON object"))
+        if bytes[i] == UInt8('}')
+            return obj, i + 1
+        end
+        key, i = json_parse_string(bytes, i, last_i)
+        i = json_skip_ws(bytes, i, last_i)
+        i <= last_i && bytes[i] == UInt8(':') || throw(ArgumentError("expected ':' in JSON object"))
+        parsed_value = json_parse_value(bytes, i + 1, last_i)
+        value = parsed_value[1]::JWTDecodedValue
+        i = parsed_value[2]
+        obj[key] = value
+        i = json_skip_ws(bytes, i, last_i)
+        i <= last_i || throw(ArgumentError("unterminated JSON object"))
+        if bytes[i] == UInt8(',')
+            i += 1
+        elseif bytes[i] == UInt8('}')
+            return obj, i + 1
+        else
+            throw(ArgumentError("expected ',' or '}' in JSON object"))
+        end
+    end
+end
+
+function json_parse_value(bytes, i::Int, last_i::Int)::Tuple{JWTDecodedValue,Int}
+    i = json_skip_ws(bytes, i, last_i)
+    i <= last_i || throw(ArgumentError("expected JSON value"))
+    c = bytes[i]
+    if c == UInt8('"')
+        return json_parse_string(bytes, i, last_i)
+    elseif c == UInt8('{')
+        return json_parse_object_any(bytes, i, last_i)
+    elseif c == UInt8('[')
+        return json_parse_array(bytes, i, last_i)
+    elseif c == UInt8('t')
+        return true, json_consume_literal(bytes, i, last_i, "true")
+    elseif c == UInt8('f')
+        return false, json_consume_literal(bytes, i, last_i, "false")
+    elseif c == UInt8('n')
+        return nothing, json_consume_literal(bytes, i, last_i, "null")
+    elseif c == UInt8('-') || UInt8('0') <= c <= UInt8('9')
+        return json_parse_number(bytes, i, last_i)
+    else
+        throw(ArgumentError("expected JSON value"))
+    end
+end
+
+function decode_jwt_json_object(encoded::String)::Dict{String,JWTDecodedValue}
+    json = String(base64url_decode(encoded))
+    bytes = codeunits(json)
+    last_i = ncodeunits(json)
+    i = json_skip_ws(bytes, 1, last_i)
+    i <= last_i && bytes[i] == UInt8('{') || throw(ArgumentError("JWT part must be a JSON object"))
+    i += 1
+    obj = Dict{String,JWTDecodedValue}()
+    while true
+        i = json_skip_ws(bytes, i, last_i)
+        i <= last_i || throw(ArgumentError("unterminated JWT JSON object"))
+        if bytes[i] == UInt8('}')
+            i = json_skip_ws(bytes, i + 1, last_i)
+            i > last_i || throw(ArgumentError("trailing data after JWT JSON object"))
+            return obj
+        end
+        key, i = json_parse_string(bytes, i, last_i)
+        i = json_skip_ws(bytes, i, last_i)
+        i <= last_i && bytes[i] == UInt8(':') || throw(ArgumentError("expected ':' in JWT JSON object"))
+        parsed_value = json_parse_value(bytes, i + 1, last_i)
+        value = parsed_value[1]::JWTDecodedValue
+        i = parsed_value[2]
+        obj[key] = value
+        i = json_skip_ws(bytes, i, last_i)
+        i <= last_i || throw(ArgumentError("unterminated JWT JSON object"))
+        if bytes[i] == UInt8(',')
+            i += 1
+        elseif bytes[i] == UInt8('}')
+            i = json_skip_ws(bytes, i + 1, last_i)
+            i > last_i || throw(ArgumentError("trailing data after JWT JSON object"))
+            return obj
+        else
+            throw(ArgumentError("expected ',' or '}' in JWT JSON object"))
+        end
+    end
+end
 
 """
     claims(jwt::JWT)
@@ -194,8 +578,7 @@ The JWT must be signed. An exception is thrown otherwise.
 """
 function kid(jwt::JWT)::Union{Nothing,String}
     issigned(jwt) || throw(ArgumentError("jwt is not signed"))
-    value = get(decodepart(jwt.header), "kid", nothing)
-    value isa String ? value : nothing
+    return jwt_header_string_claim(jwt.header, "kid")
 end
 
 """
@@ -207,8 +590,7 @@ The JWT must be signed. An exception is thrown otherwise.
 """
 function alg(jwt::JWT)::Union{Nothing,String}
     issigned(jwt) || throw(ArgumentError("jwt is not signed"))
-    value = get(decodepart(jwt.header), "alg", nothing)
-    value isa String ? value : nothing
+    return jwt_header_string_claim(jwt.header, "alg")
 end
 
 """
@@ -274,7 +656,7 @@ function validate!(jwt::JWT, key::JWK; algorithms::Vector{String}=String[])
 
     data = jwt.header * "." * jwt.payload
     sigbytes = try
-        base64decode(urldec(jwt.signature))
+        base64url_decode(jwt.signature)
     catch
         return setvalidation!(jwt, false)
     end
@@ -331,11 +713,11 @@ function sign!(jwt::JWT, key::JWK, kid::String="")
 
     header_dict = Dict{String,String}("alg"=>alg(key), "typ"=>"JWT")
     isempty(kid) || (header_dict["kid"] = kid)
-    header = urlenc(base64encode(JSON.json(header_dict)))
+    header = base64url_encode(JSON.json(header_dict))
 
     data = header * "." * jwt.payload
     sigbytes = signbytes(key, data)
-    signature = urlenc(base64encode(sigbytes))
+    signature = base64url_encode(sigbytes)
 
     setparts!(jwt, JWTParts(jwt.payload, header, signature); verified=true, valid=true)
     nothing
@@ -409,8 +791,8 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
         # ref: https://tools.ietf.org/html/rfc7518
         try
             if kty == "RSA"
-                n = base64decode(urldec(key["n"]))
-                e = base64decode(urldec(key["e"]))
+                n = base64url_decode(key["n"])
+                e = base64url_decode(key["e"])
                 if alg in RSA_ALGORITHMS
                     keysetdict[kid] = JWKRSA(alg, rsa_public_key(n, e))
                 else
@@ -418,7 +800,7 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                     continue
                 end
             elseif kty == "oct"
-                k = base64decode(urldec(key["k"]))
+                k = base64url_decode(key["k"])
                 if alg in HMAC_ALGORITHMS
                     keysetdict[kid] = JWKSymmetric(alg, k)
                 else
@@ -427,8 +809,8 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                 end
             elseif kty == "EC"
                 crv = key["crv"]
-                x = base64decode(urldec(key["x"]))
-                y = base64decode(urldec(key["y"]))
+                x = base64url_decode(key["x"])
+                y = base64url_decode(key["y"])
                 if alg in EC_ALGORITHMS
                     keysetdict[kid] = JWKEC(alg, ec_public_key(crv, x, y), crv)
                 else
@@ -437,7 +819,7 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                 end
             elseif kty == "OKP"
                 crv = key["crv"]
-                x = base64decode(urldec(key["x"]))
+                x = base64url_decode(key["x"])
                 if alg in OKP_ALGORITHMS
                     keysetdict[kid] = JWKOKP(alg, okp_public_key(crv, x), crv)
                 else
@@ -448,8 +830,8 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                 @warn("key type $kty not supported yet, skipping key $kid")
                 continue
             end
-        catch ex
-            @warn("exception $ex trying to decode, skipping key $kid")
+        catch
+            @warn("exception trying to decode, skipping key $kid")
         end
     end
     nothing
@@ -474,6 +856,69 @@ function padb64(bs)
         bs = bs * "="^(4 - surplus)
     end
     bs
+end
+
+const BASE64URL_ENCODE_TABLE = codeunits("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+const BASE64URL_INVALID = Int16(-1)
+
+function base64url_value(c::UInt8)::Int16
+    UInt8('A') <= c <= UInt8('Z') && return Int16(c - UInt8('A'))
+    UInt8('a') <= c <= UInt8('z') && return Int16(c - UInt8('a') + 26)
+    UInt8('0') <= c <= UInt8('9') && return Int16(c - UInt8('0') + 52)
+    (c == UInt8('-') || c == UInt8('+')) && return 62
+    (c == UInt8('_') || c == UInt8('/')) && return 63
+    return BASE64URL_INVALID
+end
+
+function base64url_encode(data::AbstractVector{UInt8})::String
+    bytes = data
+    out = UInt8[]
+    sizehint!(out, cld(length(bytes) * 4, 3))
+    i = firstindex(bytes)
+    last_i = lastindex(bytes)
+    while i <= last_i
+        b1 = bytes[i]
+        if i == last_i
+            push!(out, BASE64URL_ENCODE_TABLE[(b1 >> 2) + 1])
+            push!(out, BASE64URL_ENCODE_TABLE[((b1 & 0x03) << 4) + 1])
+            break
+        end
+        b2 = bytes[i + 1]
+        if i + 1 == last_i
+            push!(out, BASE64URL_ENCODE_TABLE[(b1 >> 2) + 1])
+            push!(out, BASE64URL_ENCODE_TABLE[(((b1 & 0x03) << 4) | (b2 >> 4)) + 1])
+            push!(out, BASE64URL_ENCODE_TABLE[((b2 & 0x0f) << 2) + 1])
+            break
+        end
+        b3 = bytes[i + 2]
+        push!(out, BASE64URL_ENCODE_TABLE[(b1 >> 2) + 1])
+        push!(out, BASE64URL_ENCODE_TABLE[(((b1 & 0x03) << 4) | (b2 >> 4)) + 1])
+        push!(out, BASE64URL_ENCODE_TABLE[(((b2 & 0x0f) << 2) | (b3 >> 6)) + 1])
+        push!(out, BASE64URL_ENCODE_TABLE[(b3 & 0x3f) + 1])
+        i += 3
+    end
+    return String(out)
+end
+
+base64url_encode(data::AbstractString)::String = base64url_encode(collect(codeunits(data)))
+
+function base64url_decode(data::AbstractString)::Vector{UInt8}
+    out = UInt8[]
+    sizehint!(out, (ncodeunits(data) * 3) >>> 2)
+    buffer = UInt32(0)
+    bits = 0
+    for c in codeunits(data)
+        c == UInt8('=') && break
+        value = base64url_value(c)
+        value == BASE64URL_INVALID && throw(ArgumentError("invalid base64url character"))
+        buffer = (buffer << 6) | UInt32(value)
+        bits += 6
+        if bits >= 8
+            bits -= 8
+            push!(out, UInt8((buffer >> bits) & 0xff))
+        end
+    end
+    return out
 end
 
 """

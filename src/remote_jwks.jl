@@ -1,28 +1,28 @@
-mutable struct RemoteJWKSet
+mutable struct RemoteJWKSet{F,N}
     jwks_uri::String
     keyset::JWKSet
     ttl::Float64
     refresh_cooldown::Float64
     default_algs::Dict{String,String}
-    fetcher::Any
-    now::Any
+    fetcher::F
+    now::N
     lock::ReentrantLock
     fetched_at::Union{Nothing,Float64}
     last_failure_at::Union{Nothing,Float64}
     last_unknown_refresh_at::Union{Nothing,Float64}
 end
 
-mutable struct OIDCDiscovery
+mutable struct OIDCDiscovery{F,N}
     issuer::String
     discovery_uri::String
     metadata_ttl::Float64
     jwks_ttl::Float64
     refresh_cooldown::Float64
     default_algs::Dict{String,String}
-    fetcher::Any
-    now::Any
+    fetcher::F
+    now::N
     lock::ReentrantLock
-    jwks::Union{Nothing,RemoteJWKSet}
+    jwks::Union{Nothing,RemoteJWKSet{F,N}}
     fetched_at::Union{Nothing,Float64}
     last_failure_at::Union{Nothing,Float64}
 end
@@ -55,10 +55,10 @@ function RemoteJWKSet(
     ttl::Real=300,
     refresh_cooldown::Real=30,
     default_algs=DEFAULT_JWK_ALGS,
-    fetcher=nothing,
-    downloader=nothing,
-    now=time,
-)
+    fetcher::F=nothing,
+    downloader::D=nothing,
+    now::N=time,
+) where {F,D,N}
     uri = String(jwks_uri)
     isempty(uri) && throw(ArgumentError("jwks_uri must not be empty"))
     return RemoteJWKSet(
@@ -95,11 +95,11 @@ function OIDCDiscovery(
     jwks_ttl::Real=300,
     refresh_cooldown::Real=30,
     default_algs=DEFAULT_JWK_ALGS,
-    fetcher=nothing,
-    downloader=nothing,
-    now=time,
-)
-    issuer_s = rstrip(String(issuer), '/')
+    fetcher::F=nothing,
+    downloader::D=nothing,
+    now::N=time,
+) where {F,D,N}
+    issuer_s = String(rstrip(String(issuer), '/'))
     isempty(issuer_s) && throw(ArgumentError("issuer must not be empty"))
     return OIDCDiscovery(
         issuer_s,
@@ -124,8 +124,8 @@ end
 function fetch_json_document(fetcher, url::String)
     raw = try
         fetcher(url)
-    catch ex
-        throw(JWKSError(:fetch_failed, "failed to fetch JSON document from $url: $ex"))
+    catch
+        throw(JWKSError(:fetch_failed, "failed to fetch JSON document from $url"))
     end
 
     if raw isa AbstractDict
@@ -133,14 +133,14 @@ function fetch_json_document(fetcher, url::String)
     elseif raw isa AbstractString
         try
             return JSON.parse(String(raw))
-        catch ex
-            throw(JWKSError(:parse_failed, "failed to parse JSON document from $url: $ex"))
+        catch
+            throw(JWKSError(:parse_failed, "failed to parse JSON document from $url"))
         end
     elseif raw isa AbstractVector{UInt8}
         try
             return JSON.parse(String(raw))
-        catch ex
-            throw(JWKSError(:parse_failed, "failed to parse JSON document from $url: $ex"))
+        catch
+            throw(JWKSError(:parse_failed, "failed to parse JSON document from $url"))
         end
     else
         throw(JWKSError(:fetch_result_unsupported, "fetcher for $url returned unsupported type $(typeof(raw))"))
@@ -176,10 +176,10 @@ function refresh_remote_jwks_unlocked!(source::RemoteJWKSet, now_value::Float64;
         source.fetched_at = now_value
         source.last_failure_at = nothing
         return true
-    catch ex
+    catch
         source.last_failure_at = now_value
         if throw_if_empty || isempty(source.keyset.keys)
-            throw(JWKSError(:jwks_refresh_failed, "failed to refresh JWKS from $(source.jwks_uri): $ex"))
+            throw(JWKSError(:jwks_refresh_failed, "failed to refresh JWKS from $(source.jwks_uri)"))
         end
         return false
     end
@@ -258,10 +258,10 @@ function refresh_oidc_discovery_unlocked!(source::OIDCDiscovery, now_value::Floa
         source.fetched_at = now_value
         source.last_failure_at = nothing
         return true
-    catch ex
+    catch
         source.last_failure_at = now_value
         if throw_if_empty || source.jwks === nothing
-            throw(JWKSError(:oidc_refresh_failed, "failed to refresh OIDC discovery from $(source.discovery_uri): $ex"))
+            throw(JWKSError(:oidc_refresh_failed, "failed to refresh OIDC discovery from $(source.discovery_uri)"))
         end
         return false
     end

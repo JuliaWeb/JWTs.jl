@@ -46,6 +46,8 @@ function print_header(msg)
     println("-"^60)
 end
 
+include("trim_compile_tests.jl")
+
 function test_and_get_keyset(url)
     print_header("keyset: $url")
 
@@ -273,6 +275,22 @@ function test_validation_state_safety(keyset_url)
     @test kid(missing_header_token) === nothing
     @test !validate!(missing_header_token, key; algorithms=[JWTs.alg(key)])
     @test_throws ArgumentError validate!(missing_header_token, keyset; algorithms=[JWTs.alg(key)])
+
+    header_with_extensions = JWTs.urlenc(base64encode(JSON.json(Dict{String,Any}(
+        "alg" => JWTs.alg(key),
+        "kid" => keyid,
+        "typ" => "JWT",
+        "crit" => ["exp"],
+        "nested" => Dict("accepted" => true),
+    ))))
+    extended_header_token = JWT(; jwt=join([header_with_extensions, jwt.payload, jwt.signature], "."))
+    @test JWTs.alg(extended_header_token) == JWTs.alg(key)
+    @test kid(extended_header_token) == keyid
+
+    trailing_header_data = JWTs.urlenc(base64encode("""{"alg":"$(JWTs.alg(key))","kid":"$keyid"} false"""))
+    trailing_header_token = JWT(; jwt=join([trailing_header_data, jwt.payload, jwt.signature], "."))
+    @test_throws ArgumentError JWTs.alg(trailing_header_token)
+    @test_throws ArgumentError kid(trailing_header_token)
 
     malformed = JWT(; jwt="not-a-valid-compact-token")
     @test !issigned(malformed)
