@@ -1,28 +1,28 @@
-mutable struct RemoteJWKSet{F,N}
+mutable struct RemoteJWKSet
     jwks_uri::String
     keyset::JWKSet
     ttl::Float64
     refresh_cooldown::Float64
     default_algs::Dict{String,String}
-    fetcher::F
-    now::N
+    fetcher::Function
+    now::Function
     lock::ReentrantLock
     fetched_at::Union{Nothing,Float64}
     last_failure_at::Union{Nothing,Float64}
     last_unknown_refresh_at::Union{Nothing,Float64}
 end
 
-mutable struct OIDCDiscovery{F,N}
+mutable struct OIDCDiscovery
     issuer::String
     discovery_uri::String
     metadata_ttl::Float64
     jwks_ttl::Float64
     refresh_cooldown::Float64
     default_algs::Dict{String,String}
-    fetcher::F
-    now::N
+    fetcher::Function
+    now::Function
     lock::ReentrantLock
-    jwks::Union{Nothing,RemoteJWKSet{F,N}}
+    jwks::Union{Nothing,RemoteJWKSet}
     fetched_at::Union{Nothing,Float64}
     last_failure_at::Union{Nothing,Float64}
 end
@@ -50,15 +50,21 @@ function default_remote_fetcher(downloader)
     return url -> fetch_url(url; downloader=downloader)
 end
 
+normalize_fetcher_function(fetcher::Function) = fetcher
+normalize_fetcher_function(fetcher) = url -> fetcher(url)
+
+normalize_now_function(now::Function) = now
+normalize_now_function(now) = () -> now()
+
 function RemoteJWKSet(
     jwks_uri::AbstractString;
     ttl::Real=300,
     refresh_cooldown::Real=30,
     default_algs=DEFAULT_JWK_ALGS,
-    fetcher::F=nothing,
-    downloader::D=nothing,
-    now::N=time,
-) where {F,D,N}
+    fetcher=nothing,
+    downloader=nothing,
+    now=time,
+)
     uri = String(jwks_uri)
     isempty(uri) && throw(ArgumentError("jwks_uri must not be empty"))
     return RemoteJWKSet(
@@ -67,8 +73,8 @@ function RemoteJWKSet(
         normalize_cache_seconds("ttl", ttl),
         normalize_cache_seconds("refresh_cooldown", refresh_cooldown),
         normalize_default_algs(default_algs),
-        fetcher === nothing ? default_remote_fetcher(downloader) : fetcher,
-        now,
+        normalize_fetcher_function(fetcher === nothing ? default_remote_fetcher(downloader) : fetcher),
+        normalize_now_function(now),
         ReentrantLock(),
         nothing,
         nothing,
@@ -95,10 +101,10 @@ function OIDCDiscovery(
     jwks_ttl::Real=300,
     refresh_cooldown::Real=30,
     default_algs=DEFAULT_JWK_ALGS,
-    fetcher::F=nothing,
-    downloader::D=nothing,
-    now::N=time,
-) where {F,D,N}
+    fetcher=nothing,
+    downloader=nothing,
+    now=time,
+)
     issuer_s = String(rstrip(String(issuer), '/'))
     isempty(issuer_s) && throw(ArgumentError("issuer must not be empty"))
     return OIDCDiscovery(
@@ -108,8 +114,8 @@ function OIDCDiscovery(
         normalize_cache_seconds("jwks_ttl", jwks_ttl),
         normalize_cache_seconds("refresh_cooldown", refresh_cooldown),
         normalize_default_algs(default_algs),
-        fetcher === nothing ? default_remote_fetcher(downloader) : fetcher,
-        now,
+        normalize_fetcher_function(fetcher === nothing ? default_remote_fetcher(downloader) : fetcher),
+        normalize_now_function(now),
         ReentrantLock(),
         nothing,
         nothing,
