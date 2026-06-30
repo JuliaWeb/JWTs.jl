@@ -5,6 +5,15 @@
 
 JWTs.jl signs and verifies JSON Web Tokens (JWTs) and JSON Web Keys (JWKs). It supports local key sets, cached remote JWKS endpoints, and OpenID Connect discovery without requiring HTTP.jl.
 
+## Installation
+
+```julia
+import Pkg
+Pkg.add("JWTs")
+```
+
+JWTs.jl supports Julia 1.6 and newer.
+
 ## Supported Algorithms
 
 JWTs.jl supports these JOSE signing algorithms:
@@ -19,7 +28,7 @@ Asymmetric crypto uses OpenSSL through OpenSSL_jll. HMAC uses SHA.jl.
 
 ## Keys
 
-`JWTs.JWKSet` stores keys by `kid`. It can be created from a JWKS URL, a `file://` URL, or an in-memory vector of parsed JWK dictionaries.
+`JWTs.JWKSet` stores keys by `kid`. It can be created from a JWKS URL, a `file://` URL, or an in-memory vector of parsed JWK dictionaries. JWKS parsing supports public RSA, EC, OKP/Ed25519, and symmetric HMAC keys.
 
 ```julia
 using JWTs
@@ -31,7 +40,7 @@ key = keyset.keys["signing-key-id"]
 JWTs.alg(key)
 ```
 
-Private PEM keys can be loaded with `JWTs.parse_keyfile`.
+Private PEM keys can be loaded with `JWTs.parse_keyfile`. RSA, EC, and Ed25519 private keys are supported for signing.
 
 ```julia
 private_key = JWTs.parse_keyfile("/secure/path/rs256.private.pem")
@@ -69,6 +78,14 @@ You can also sign from a key set:
 JWTs.sign!(jwt, signing_keyset, "signing-key-id")
 ```
 
+## Token Representation
+
+`JWTs.JWT` stores the compact JWT parts in encoded form. `jwt.payload`, `jwt.header`, and `jwt.signature` correspond to the base64url-encoded compact token segments. `jwt.header` and `jwt.signature` are `nothing` until the token is signed or parsed from a signed compact JWT string.
+
+`JWTs.claims(jwt)` decodes and parses the payload JSON with JSON.jl. `JWTs.kid(jwt)` and `JWTs.alg(jwt)` read the decoded header values from a signed token.
+
+For compatibility with older code, direct assignment to `jwt.payload`, `jwt.header`, and `jwt.signature` is accepted for encoded compact token parts. Any such assignment clears the cached validation state. `jwt.verified` and `jwt.valid` are read-only; call `JWTs.sign!`, `JWTs.validate!`, or `JWTs.verify` to update validation state.
+
 ## Verification With Claims
 
 For applications, prefer `JWTs.Verifier` over calling `validate!` directly. A verifier checks the signature, enforces an explicit algorithm allowlist, validates registered claims, and returns a `JWTs.VerifiedJWT` only after all checks pass.
@@ -103,6 +120,8 @@ Supported verifier options include:
 
 `aud` may be either a string or an array of strings, matching RFC 7519.
 
+`JWTs.VerifiedJWT` exposes the original parsed token as `verified.token`, the decoded header as `verified.header`, the decoded claims as `verified.claims`, and the matched verification key as `verified.key`. The convenience accessors `JWTs.claims(verified)`, `JWTs.kid(verified)`, and `JWTs.alg(verified)` are also available.
+
 ## Remote JWKS
 
 For a provider JWKS endpoint, construct a verifier with `jwks_uri`. Keys are fetched lazily, cached for `jwks_ttl` seconds, refreshed when stale, and refreshed early when a token contains an unknown `kid`.
@@ -129,7 +148,7 @@ fetcher = url -> read("fixtures/jwks.json", String)
 verifier = JWTs.Verifier(; jwks_uri="https://issuer.example/keys", algorithms=["RS256"], fetcher=fetcher)
 ```
 
-The default fetcher uses Downloads.jl.
+The default fetcher uses Downloads.jl. Pass `downloader=Downloads.Downloader()` when you want to reuse a configured Downloads downloader, or pass `fetcher=url -> ...` when tests or applications need full control over network access.
 
 ## OpenID Connect Discovery
 
@@ -158,7 +177,7 @@ jwt = JWTs.JWT(token_string)
 JWTs.validate!(jwt, keyset, "signing-key-id"; algorithms=["RS256"])
 ```
 
-Use these helpers when you intentionally want only signature validation. Use `JWTs.Verifier` for application authentication and authorization boundaries.
+Use these helpers when you intentionally want only signature validation. `algorithms` is optional for backwards compatibility, but passing an explicit allowlist is strongly recommended. Use `JWTs.Verifier` for application authentication and authorization boundaries.
 
 ## Errors
 
@@ -195,7 +214,7 @@ end
 - Use `nonce` for ID-token replay protection when your protocol requires it.
 - Keep key fetchers restricted to trusted issuer URLs.
 
-## Migrating From MbedTLS
+## Migration Notes
 
 JWTs.jl no longer depends on MbedTLS. Replace direct MbedTLS key parsing with `JWTs.parse_keyfile`.
 
@@ -207,4 +226,6 @@ JWTs.jl no longer depends on MbedTLS. Replace direct MbedTLS key parsing with `J
 key = JWTs.JWKRSA("RS256", JWTs.parse_keyfile("rs256.private.pem"))
 ```
 
-The high-level `JWTs.JWT`, `JWTs.JWKSet`, `JWTs.sign!`, `JWTs.validate!`, `JWTs.with_valid_jwt`, and `JWTs.claims` APIs remain available. New application code should prefer `JWTs.Verifier` and `JWTs.verify` for end-to-end verification.
+The high-level `JWTs.JWT`, `JWTs.JWKSet`, `JWTs.sign!`, `JWTs.validate!`, `JWTs.with_valid_jwt`, and `JWTs.claims` APIs remain available. `JWTs.validate!` still returns `true` or `false` and mutates `jwt.valid`; `JWTs.verify` throws typed JWT errors and returns a `JWTs.VerifiedJWT`.
+
+JWTs.jl now requires Julia 1.6 or newer and uses OpenSSL_jll for asymmetric crypto. New application code should prefer `JWTs.Verifier` and `JWTs.verify` for end-to-end verification.

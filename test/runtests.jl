@@ -130,9 +130,30 @@ function test_signing_keys(keyset, signingkeyset, algorithms::Vector{String})
             @test isvalid(jwt)
             @test isverified(jwt)
             @test claims(jwt) == d
-            @test_throws ArgumentError setproperty!(jwt, :payload, jwt.payload)
-            @test_throws ArgumentError setproperty!(jwt, :header, jwt.header)
-            @test_throws ArgumentError setproperty!(jwt, :signature, jwt.signature)
+            original_payload = jwt.payload
+            original_header = jwt.header
+            original_signature = jwt.signature
+            jwt.payload = original_payload
+            @test jwt.payload == original_payload
+            @test jwt.header == original_header
+            @test jwt.signature == original_signature
+            @test !isverified(jwt)
+            @test isvalid(jwt) === nothing
+            @test validate!(jwt, keyset, k; algorithms=algorithms)
+            jwt.header = original_header
+            @test jwt.header == original_header
+            @test !isverified(jwt)
+            @test isvalid(jwt) === nothing
+            @test validate!(jwt, keyset, k; algorithms=algorithms)
+            jwt.signature = original_signature
+            @test jwt.signature == original_signature
+            @test !isverified(jwt)
+            @test isvalid(jwt) === nothing
+            @test validate!(jwt, keyset, k; algorithms=algorithms)
+            @test_throws ArgumentError setproperty!(jwt, :verified, true)
+            @test_throws ArgumentError setproperty!(jwt, :valid, true)
+            @test_throws ArgumentError setproperty!(jwt, :payload, nothing)
+            @test_throws ArgumentError setproperty!(jwt, :header, 1)
             @test JWTs.alg(jwt) == JWTs.alg(keyset.keys[k])
             @test kid(jwt) == k
             header = JWTs.decodepart(jwt.header)

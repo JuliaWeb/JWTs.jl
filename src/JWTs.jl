@@ -143,12 +143,32 @@ function getproperty(jwt::JWT, name::Symbol)
     end
 end
 
+function jwt_encoded_part(value, name::Symbol)::String
+    value isa AbstractString || throw(ArgumentError("JWT.$name must be a string"))
+    return String(value)
+end
+
+function jwt_optional_encoded_part(value, name::Symbol)::Union{Nothing,String}
+    value === nothing && return nothing
+    return jwt_encoded_part(value, name)
+end
+
 function setproperty!(jwt::JWT, name::Symbol, value)
-    if name in (:payload, :header, :signature, :verified, :valid)
-        throw(ArgumentError("JWT.$name is read-only"))
+    if name === :payload
+        parts = getfield(jwt, :_parts)
+        setparts!(jwt, JWTParts(jwt_encoded_part(value, name), parts.header, parts.signature); verified=false, valid=nothing)
+    elseif name === :header
+        parts = getfield(jwt, :_parts)
+        setparts!(jwt, JWTParts(parts.payload, jwt_optional_encoded_part(value, name), parts.signature); verified=false, valid=nothing)
+    elseif name === :signature
+        parts = getfield(jwt, :_parts)
+        setparts!(jwt, JWTParts(parts.payload, parts.header, jwt_optional_encoded_part(value, name)); verified=false, valid=nothing)
+    elseif name === :verified || name === :valid
+        throw(ArgumentError("JWT.$name is read-only; call sign! or validate! to update validation state"))
     else
         setfield!(jwt, name, value)
     end
+    return value
 end
 
 function setvalidation!(jwt::JWT, valid::Union{Nothing,Bool})
