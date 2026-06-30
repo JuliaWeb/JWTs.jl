@@ -100,15 +100,16 @@ The key URL can either be of `http(s)://` or `file://` type.
 mutable struct JWKSet
     url::String
     keys::Dict{String,JWK}
+    lock::ReentrantLock
 
     function JWKSet(url::String)
-        new(url, Dict{String,JWK}())
+        new(url, Dict{String,JWK}(), ReentrantLock())
     end
 
     function JWKSet(keyset::Vector)
         keysetdict = Dict{String,JWK}()
         refresh!(keyset, keysetdict)
-        new("", keysetdict)
+        new("", keysetdict, ReentrantLock())
     end
 end
 function show(io::IO, jwk::JWKSet)
@@ -294,7 +295,7 @@ function signbytes(key::JWK, data::AbstractString)
     if key isa JWKSymmetric
         return hmac_digest(alg(key), key.key, data)
     elseif key isa JWKRSA
-        return sign_rsa(key.key, alg(key), data)
+        return evp_digest_sign(key.key, alg(key), data)
     elseif key isa JWKEC
         return sign_ec(key.key, alg(key), data)
     else
@@ -306,7 +307,7 @@ function verifybytes(key::JWK, data::AbstractString, signature::AbstractVector{U
     if key isa JWKSymmetric
         return constant_time_equal(hmac_digest(alg(key), key.key, data), signature)
     elseif key isa JWKRSA
-        return verify_rsa(key.key, alg(key), data, signature)
+        return evp_digest_verify(key.key, alg(key), data, signature)
     elseif key isa JWKEC
         return verify_ec(key.key, alg(key), data, signature)
     else
@@ -445,7 +446,12 @@ function fetch_url(url::String; downloader=nothing)
         return readchomp(url[8:end])
     else
         output = PipeBuffer()
-        Downloads.request(url; method="GET", output=output, downloader=downloader)
+        response = Downloads.request(url; method="GET", output=output, downloader=downloader)
+        # Downloads.request only throws on transport-level errors, not on HTTP error
+        # status codes, so a 4xx/5xx error page would otherwise be parsed as a keyset.
+        if response isa Downloads.Response && !(200 <= response.status < 300)
+            throw(ErrorException("failed to fetch $url: HTTP status $(response.status)"))
+        end
         return String(take!(output))
     end
 end
@@ -466,7 +472,7 @@ function default_jwk_alg(key, default_algs)
     end
 end
 
-function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"))
+function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), allow_symmetric::Bool=true)
     for key in keys
         kid = key["kid"]
         kty = key["kty"]
@@ -484,6 +490,10 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                     continue
                 end
             elseif kty == "oct"
+                if !allow_symmetric
+                    @warn("symmetric keys are not accepted from this key source, skipping key $kid")
+                    continue
+                end
                 k = base64url_decode(key["k"])
                 if alg in HMAC_ALGORITHMS
                     keysetdict[kid] = JWKSymmetric(alg, k)
@@ -521,27 +531,6 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
     nothing
 end
 
-function urldec(bs)
-    bs = replace(bs, "-"=>"+")
-    bs = replace(bs, "_"=>"/")
-    padb64(bs)
-end
-
-function urlenc(bs)
-    bs = replace(bs, "+"=>"-")
-    bs = replace(bs, "/"=>"_")
-    bs = replace(bs, "="=>"")
-    bs
-end
-
-function padb64(bs)
-    surplus = length(bs) % 4
-    if surplus > 0
-        bs = bs * "="^(4 - surplus)
-    end
-    bs
-end
-
 const BASE64URL_ENCODE_TABLE = codeunits("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
 const BASE64URL_INVALID = Int16(-1)
 
@@ -549,8 +538,8 @@ function base64url_value(c::UInt8)::Int16
     UInt8('A') <= c <= UInt8('Z') && return Int16(c - UInt8('A'))
     UInt8('a') <= c <= UInt8('z') && return Int16(c - UInt8('a') + 26)
     UInt8('0') <= c <= UInt8('9') && return Int16(c - UInt8('0') + 52)
-    (c == UInt8('-') || c == UInt8('+')) && return 62
-    (c == UInt8('_') || c == UInt8('/')) && return 63
+    c == UInt8('-') && return Int16(62)
+    c == UInt8('_') && return Int16(63)
     return BASE64URL_INVALID
 end
 
@@ -587,13 +576,18 @@ end
 base64url_encode(data::AbstractString)::String = base64url_encode(collect(codeunits(data)))
 
 function base64url_decode(data::AbstractString)::Vector{UInt8}
+    bytes = codeunits(data)
+    n = length(bytes)
+    # Tolerate, but do not require, trailing '=' padding; reject '=' anywhere else.
+    while n > 0 && bytes[n] == UInt8('=')
+        n -= 1
+    end
     out = UInt8[]
-    sizehint!(out, (ncodeunits(data) * 3) >>> 2)
+    sizehint!(out, (n * 3) >>> 2)
     buffer = UInt32(0)
     bits = 0
-    for c in codeunits(data)
-        c == UInt8('=') && break
-        value = base64url_value(c)
+    @inbounds for i in 1:n
+        value = base64url_value(bytes[i])
         value == BASE64URL_INVALID && throw(ArgumentError("invalid base64url character"))
         buffer = (buffer << 6) | UInt32(value)
         bits += 6
@@ -602,6 +596,10 @@ function base64url_decode(data::AbstractString)::Vector{UInt8}
             push!(out, UInt8((buffer >> bits) & 0xff))
         end
     end
+    # A 6-bit remainder means length % 4 == 1, which cannot encode any byte.
+    bits == 6 && throw(ArgumentError("invalid base64url length"))
+    # The remaining 0/2/4 bits must be zero for a canonical base64url encoding.
+    (buffer & ((UInt32(1) << bits) - UInt32(1))) == 0 || throw(ArgumentError("non-canonical base64url padding bits"))
     return out
 end
 

@@ -416,65 +416,70 @@ function configure_rsa_pss!(pctx::Ptr{Cvoid}, alg::AbstractString)
     return nothing
 end
 
-function sign_rsa(key::OpenSSLKey, alg::AbstractString, data::AbstractString)
+function evp_digest_sign(key::OpenSSLKey, alg::AbstractString, data::AbstractString)
     signed = Vector{UInt8}(codeunits(data))
     mdctx = ccall((:EVP_MD_CTX_new, LIBCRYPTO), Ptr{Cvoid}, ())
     require_openssl_nonnull(mdctx, "EVP_MD_CTX_new")
     try
-        pctx_ref = Ref{Ptr{Cvoid}}(C_NULL)
-        require_openssl_ok(
-            ccall(
-                (:EVP_DigestSignInit_ex, LIBCRYPTO),
-                Cint,
-                (Ptr{Cvoid}, Ref{Ptr{Cvoid}}, Cstring, Ptr{Cvoid}, Cstring, Ptr{Cvoid}, Ptr{Cvoid}),
-                mdctx,
-                pctx_ref,
-                openssl_digest_name(alg),
-                C_NULL,
-                C_NULL,
-                key.ptr,
-                C_NULL,
-            ),
-            "EVP_DigestSignInit_ex",
-        )
-        configure_rsa_pss!(pctx_ref[], alg)
-        ret = GC.@preserve signed begin
-            ccall(
-                (:EVP_DigestSignUpdate, LIBCRYPTO),
-                Cint,
-                (Ptr{Cvoid}, Ptr{UInt8}, Csize_t),
-                mdctx,
-                pointer(signed),
-                Csize_t(length(signed)),
+        # `key` must stay reachable across the whole Init/Update/Final sequence: OpenSSL
+        # borrows the EVP_PKEY without taking a reference, so letting the OpenSSLKey
+        # finalizer run mid-operation would free it underneath us (use-after-free).
+        return GC.@preserve key begin
+            pctx_ref = Ref{Ptr{Cvoid}}(C_NULL)
+            require_openssl_ok(
+                ccall(
+                    (:EVP_DigestSignInit_ex, LIBCRYPTO),
+                    Cint,
+                    (Ptr{Cvoid}, Ref{Ptr{Cvoid}}, Cstring, Ptr{Cvoid}, Cstring, Ptr{Cvoid}, Ptr{Cvoid}),
+                    mdctx,
+                    pctx_ref,
+                    openssl_digest_name(alg),
+                    C_NULL,
+                    C_NULL,
+                    key.ptr,
+                    C_NULL,
+                ),
+                "EVP_DigestSignInit_ex",
             )
-        end
-        require_openssl_ok(ret, "EVP_DigestSignUpdate")
-        out_len = Ref{Csize_t}(0)
-        require_openssl_ok(
-            ccall((:EVP_DigestSignFinal, LIBCRYPTO), Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ref{Csize_t}), mdctx, Ptr{UInt8}(C_NULL), out_len),
-            "EVP_DigestSignFinal",
-        )
-        out = Vector{UInt8}(undef, Int(out_len[]))
-        ret = GC.@preserve out begin
-            ccall(
-                (:EVP_DigestSignFinal, LIBCRYPTO),
-                Cint,
-                (Ptr{Cvoid}, Ptr{UInt8}, Ref{Csize_t}),
-                mdctx,
-                pointer(out),
-                out_len,
+            configure_rsa_pss!(pctx_ref[], alg)
+            ret = GC.@preserve signed begin
+                ccall(
+                    (:EVP_DigestSignUpdate, LIBCRYPTO),
+                    Cint,
+                    (Ptr{Cvoid}, Ptr{UInt8}, Csize_t),
+                    mdctx,
+                    pointer(signed),
+                    Csize_t(length(signed)),
+                )
+            end
+            require_openssl_ok(ret, "EVP_DigestSignUpdate")
+            out_len = Ref{Csize_t}(0)
+            require_openssl_ok(
+                ccall((:EVP_DigestSignFinal, LIBCRYPTO), Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ref{Csize_t}), mdctx, Ptr{UInt8}(C_NULL), out_len),
+                "EVP_DigestSignFinal",
             )
+            out = Vector{UInt8}(undef, Int(out_len[]))
+            ret = GC.@preserve out begin
+                ccall(
+                    (:EVP_DigestSignFinal, LIBCRYPTO),
+                    Cint,
+                    (Ptr{Cvoid}, Ptr{UInt8}, Ref{Csize_t}),
+                    mdctx,
+                    pointer(out),
+                    out_len,
+                )
+            end
+            require_openssl_ok(ret, "EVP_DigestSignFinal")
+            resize!(out, Int(out_len[]))
+            out
         end
-        require_openssl_ok(ret, "EVP_DigestSignFinal")
-        resize!(out, Int(out_len[]))
-        return out
     finally
         free_evp_md_ctx!(mdctx)
     end
 end
 
 function sign_ec(key::OpenSSLKey, alg::AbstractString, data::AbstractString)
-    der = sign_rsa(key, alg, data)
+    der = evp_digest_sign(key, alg, data)
     return der_ecdsa_to_jose(der, ec_signature_bytes(alg))
 end
 
@@ -484,104 +489,110 @@ function sign_okp(key::OpenSSLKey, alg::AbstractString, data::AbstractString)
     mdctx = ccall((:EVP_MD_CTX_new, LIBCRYPTO), Ptr{Cvoid}, ())
     require_openssl_nonnull(mdctx, "EVP_MD_CTX_new")
     try
-        pctx_ref = Ref{Ptr{Cvoid}}(C_NULL)
-        require_openssl_ok(
-            ccall(
-                (:EVP_DigestSignInit_ex, LIBCRYPTO),
-                Cint,
-                (Ptr{Cvoid}, Ref{Ptr{Cvoid}}, Cstring, Ptr{Cvoid}, Cstring, Ptr{Cvoid}, Ptr{Cvoid}),
-                mdctx,
-                pctx_ref,
-                C_NULL,
-                C_NULL,
-                C_NULL,
-                key.ptr,
-                C_NULL,
-            ),
-            "EVP_DigestSignInit_ex",
-        )
-        out_len = Ref{Csize_t}(0)
-        ret = GC.@preserve signed begin
-            ccall(
-                (:EVP_DigestSign, LIBCRYPTO),
-                Cint,
-                (Ptr{Cvoid}, Ptr{UInt8}, Ref{Csize_t}, Ptr{UInt8}, Csize_t),
-                mdctx,
-                Ptr{UInt8}(C_NULL),
-                out_len,
-                pointer(signed),
-                Csize_t(length(signed)),
+        # See evp_digest_sign: keep `key` alive for the whole borrowed-pkey operation.
+        return GC.@preserve key begin
+            pctx_ref = Ref{Ptr{Cvoid}}(C_NULL)
+            require_openssl_ok(
+                ccall(
+                    (:EVP_DigestSignInit_ex, LIBCRYPTO),
+                    Cint,
+                    (Ptr{Cvoid}, Ref{Ptr{Cvoid}}, Cstring, Ptr{Cvoid}, Cstring, Ptr{Cvoid}, Ptr{Cvoid}),
+                    mdctx,
+                    pctx_ref,
+                    C_NULL,
+                    C_NULL,
+                    C_NULL,
+                    key.ptr,
+                    C_NULL,
+                ),
+                "EVP_DigestSignInit_ex",
             )
+            out_len = Ref{Csize_t}(0)
+            ret = GC.@preserve signed begin
+                ccall(
+                    (:EVP_DigestSign, LIBCRYPTO),
+                    Cint,
+                    (Ptr{Cvoid}, Ptr{UInt8}, Ref{Csize_t}, Ptr{UInt8}, Csize_t),
+                    mdctx,
+                    Ptr{UInt8}(C_NULL),
+                    out_len,
+                    pointer(signed),
+                    Csize_t(length(signed)),
+                )
+            end
+            require_openssl_ok(ret, "EVP_DigestSign")
+            out = Vector{UInt8}(undef, Int(out_len[]))
+            ret = GC.@preserve signed out begin
+                ccall(
+                    (:EVP_DigestSign, LIBCRYPTO),
+                    Cint,
+                    (Ptr{Cvoid}, Ptr{UInt8}, Ref{Csize_t}, Ptr{UInt8}, Csize_t),
+                    mdctx,
+                    pointer(out),
+                    out_len,
+                    pointer(signed),
+                    Csize_t(length(signed)),
+                )
+            end
+            require_openssl_ok(ret, "EVP_DigestSign")
+            resize!(out, Int(out_len[]))
+            out
         end
-        require_openssl_ok(ret, "EVP_DigestSign")
-        out = Vector{UInt8}(undef, Int(out_len[]))
-        ret = GC.@preserve signed out begin
-            ccall(
-                (:EVP_DigestSign, LIBCRYPTO),
-                Cint,
-                (Ptr{Cvoid}, Ptr{UInt8}, Ref{Csize_t}, Ptr{UInt8}, Csize_t),
-                mdctx,
-                pointer(out),
-                out_len,
-                pointer(signed),
-                Csize_t(length(signed)),
-            )
-        end
-        require_openssl_ok(ret, "EVP_DigestSign")
-        resize!(out, Int(out_len[]))
-        return out
     finally
         free_evp_md_ctx!(mdctx)
     end
 end
 
-function verify_rsa(key::OpenSSLKey, alg::AbstractString, data::AbstractString, signature::AbstractVector{UInt8})
+function evp_digest_verify(key::OpenSSLKey, alg::AbstractString, data::AbstractString, signature::AbstractVector{UInt8})
     signed = Vector{UInt8}(codeunits(data))
     sig = signature isa Vector{UInt8} ? signature : Vector{UInt8}(signature)
     mdctx = ccall((:EVP_MD_CTX_new, LIBCRYPTO), Ptr{Cvoid}, ())
     require_openssl_nonnull(mdctx, "EVP_MD_CTX_new")
     try
-        pctx_ref = Ref{Ptr{Cvoid}}(C_NULL)
-        require_openssl_ok(
-            ccall(
-                (:EVP_DigestVerifyInit_ex, LIBCRYPTO),
-                Cint,
-                (Ptr{Cvoid}, Ref{Ptr{Cvoid}}, Cstring, Ptr{Cvoid}, Cstring, Ptr{Cvoid}, Ptr{Cvoid}),
-                mdctx,
-                pctx_ref,
-                openssl_digest_name(alg),
-                C_NULL,
-                C_NULL,
-                key.ptr,
-                C_NULL,
-            ),
-            "EVP_DigestVerifyInit_ex",
-        )
-        configure_rsa_pss!(pctx_ref[], alg)
-        ret = GC.@preserve signed begin
-            ccall(
-                (:EVP_DigestVerifyUpdate, LIBCRYPTO),
-                Cint,
-                (Ptr{Cvoid}, Ptr{UInt8}, Csize_t),
-                mdctx,
-                pointer(signed),
-                Csize_t(length(signed)),
+        # See evp_digest_sign: keep `key` alive for the whole borrowed-pkey operation.
+        return GC.@preserve key begin
+            pctx_ref = Ref{Ptr{Cvoid}}(C_NULL)
+            require_openssl_ok(
+                ccall(
+                    (:EVP_DigestVerifyInit_ex, LIBCRYPTO),
+                    Cint,
+                    (Ptr{Cvoid}, Ref{Ptr{Cvoid}}, Cstring, Ptr{Cvoid}, Cstring, Ptr{Cvoid}, Ptr{Cvoid}),
+                    mdctx,
+                    pctx_ref,
+                    openssl_digest_name(alg),
+                    C_NULL,
+                    C_NULL,
+                    key.ptr,
+                    C_NULL,
+                ),
+                "EVP_DigestVerifyInit_ex",
             )
+            configure_rsa_pss!(pctx_ref[], alg)
+            ret = GC.@preserve signed begin
+                ccall(
+                    (:EVP_DigestVerifyUpdate, LIBCRYPTO),
+                    Cint,
+                    (Ptr{Cvoid}, Ptr{UInt8}, Csize_t),
+                    mdctx,
+                    pointer(signed),
+                    Csize_t(length(signed)),
+                )
+            end
+            require_openssl_ok(ret, "EVP_DigestVerifyUpdate")
+            verify_ret = GC.@preserve sig begin
+                ccall(
+                    (:EVP_DigestVerifyFinal, LIBCRYPTO),
+                    Cint,
+                    (Ptr{Cvoid}, Ptr{UInt8}, Csize_t),
+                    mdctx,
+                    pointer(sig),
+                    Csize_t(length(sig)),
+                )
+            end
+            verify_ret == 1 && return true
+            verify_ret == 0 && return false
+            throw(openssl_error("EVP_DigestVerifyFinal"))
         end
-        require_openssl_ok(ret, "EVP_DigestVerifyUpdate")
-        ret = GC.@preserve sig begin
-            ccall(
-                (:EVP_DigestVerifyFinal, LIBCRYPTO),
-                Cint,
-                (Ptr{Cvoid}, Ptr{UInt8}, Csize_t),
-                mdctx,
-                pointer(sig),
-                Csize_t(length(sig)),
-            )
-        end
-        ret == 1 && return true
-        ret == 0 && return false
-        throw(openssl_error("EVP_DigestVerifyFinal"))
     finally
         free_evp_md_ctx!(mdctx)
     end
@@ -589,7 +600,7 @@ end
 
 function verify_ec(key::OpenSSLKey, alg::AbstractString, data::AbstractString, signature::AbstractVector{UInt8})
     der = jose_ecdsa_to_der(signature, ec_signature_bytes(alg))
-    return verify_rsa(key, alg, data, der)
+    return evp_digest_verify(key, alg, data, der)
 end
 
 function verify_okp(key::OpenSSLKey, alg::AbstractString, data::AbstractString, signature::AbstractVector{UInt8})
@@ -599,37 +610,40 @@ function verify_okp(key::OpenSSLKey, alg::AbstractString, data::AbstractString, 
     mdctx = ccall((:EVP_MD_CTX_new, LIBCRYPTO), Ptr{Cvoid}, ())
     require_openssl_nonnull(mdctx, "EVP_MD_CTX_new")
     try
-        pctx_ref = Ref{Ptr{Cvoid}}(C_NULL)
-        require_openssl_ok(
-            ccall(
-                (:EVP_DigestVerifyInit_ex, LIBCRYPTO),
-                Cint,
-                (Ptr{Cvoid}, Ref{Ptr{Cvoid}}, Cstring, Ptr{Cvoid}, Cstring, Ptr{Cvoid}, Ptr{Cvoid}),
-                mdctx,
-                pctx_ref,
-                C_NULL,
-                C_NULL,
-                C_NULL,
-                key.ptr,
-                C_NULL,
-            ),
-            "EVP_DigestVerifyInit_ex",
-        )
-        ret = GC.@preserve signed sig begin
-            ccall(
-                (:EVP_DigestVerify, LIBCRYPTO),
-                Cint,
-                (Ptr{Cvoid}, Ptr{UInt8}, Csize_t, Ptr{UInt8}, Csize_t),
-                mdctx,
-                pointer(sig),
-                Csize_t(length(sig)),
-                pointer(signed),
-                Csize_t(length(signed)),
+        # See evp_digest_sign: keep `key` alive for the whole borrowed-pkey operation.
+        return GC.@preserve key begin
+            pctx_ref = Ref{Ptr{Cvoid}}(C_NULL)
+            require_openssl_ok(
+                ccall(
+                    (:EVP_DigestVerifyInit_ex, LIBCRYPTO),
+                    Cint,
+                    (Ptr{Cvoid}, Ref{Ptr{Cvoid}}, Cstring, Ptr{Cvoid}, Cstring, Ptr{Cvoid}, Ptr{Cvoid}),
+                    mdctx,
+                    pctx_ref,
+                    C_NULL,
+                    C_NULL,
+                    C_NULL,
+                    key.ptr,
+                    C_NULL,
+                ),
+                "EVP_DigestVerifyInit_ex",
             )
+            verify_ret = GC.@preserve signed sig begin
+                ccall(
+                    (:EVP_DigestVerify, LIBCRYPTO),
+                    Cint,
+                    (Ptr{Cvoid}, Ptr{UInt8}, Csize_t, Ptr{UInt8}, Csize_t),
+                    mdctx,
+                    pointer(sig),
+                    Csize_t(length(sig)),
+                    pointer(signed),
+                    Csize_t(length(signed)),
+                )
+            end
+            verify_ret == 1 && return true
+            verify_ret == 0 && return false
+            throw(openssl_error("EVP_DigestVerify"))
         end
-        ret == 1 && return true
-        ret == 0 && return false
-        throw(openssl_error("EVP_DigestVerify"))
     finally
         free_evp_md_ctx!(mdctx)
     end

@@ -71,7 +71,7 @@ payload = Dict(
 
 jwt = JWTs.JWT(; payload=payload)
 JWTs.sign!(jwt, signing_key, "signing-key-id")
-String(jwt)
+string(jwt)
 ```
 
 You can also sign from a key set:

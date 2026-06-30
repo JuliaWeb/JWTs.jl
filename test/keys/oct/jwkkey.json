@@ -19,21 +19,21 @@
             "kty":"oct",
             "alg":"HS384",
             "use":"sig",
-            "k":"g3z71n0KOUSPgqaOqJkX1raLSgP27gR96HjN3BEYCHfoo9rf+hVpl/t093R5uRWN"
+            "k":"g3z71n0KOUSPgqaOqJkX1raLSgP27gR96HjN3BEYCHfoo9rf-hVpl_t093R5uRWN"
         },
         {
             "kid":"7fYTP3lFbHRId0Ez-K3Ans042BdIczxG6BqnjMyOAe",
             "kty":"oct",
             "alg":"HS512",
             "use":"sig",
-            "k":"9FiEdO6HRRWtxnoU4nirCvz9XNS5Cq+qBnre0b7WsK1yV2xzbtQ1fDUeMLOYGtAN1rpmUXHw0X/HFIbIrlfxWA"
+            "k":"9FiEdO6HRRWtxnoU4nirCvz9XNS5Cq-qBnre0b7WsK1yV2xzbtQ1fDUeMLOYGtAN1rpmUXHw0X_HFIbIrlfxWA"
         },
         {
             "kid":"0fYTP3lFbHRId0Ez-K3Ans042BdIczxG6BqnjMyOAe",
             "kty":"oct",
             "alg":"HSINVALID",
             "use":"sig",
-            "k":"9FiEdO6HRRWtxnoU4nirCvz9XNS5Cq+qBnre0b7WsK1yV2xzbtQ1fDUeMLOYGtAN1rpmUXHw0X/HFIbIrlfxWA"
+            "k":"9FiEdO6HRRWtxnoU4nirCvz9XNS5Cq-qBnre0b7WsK1yV2xzbtQ1fDUeMLOYGtAN1rpmUXHw0X_HFIbIrlfxWA"
         }
     ]
 }

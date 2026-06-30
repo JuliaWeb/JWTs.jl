@@ -175,13 +175,15 @@ function claim_number(claimset, name::String)
 end
 
 function claim_string(claimset, name::String)
-    value = get(claimset, name, nothing)
+    haskey(claimset, name) || throw(JWTClaimError(:claim_missing, "jwt missing required claim $name"))
+    value = claimset[name]
     value isa AbstractString && return String(value)
     throw(JWTClaimError(:claim_type, "jwt claim $name must be a string"))
 end
 
 function claim_audiences(claimset)
-    value = get(claimset, "aud", nothing)
+    haskey(claimset, "aud") || throw(JWTClaimError(:claim_missing, "jwt missing required claim aud"))
+    value = claimset["aud"]
     value isa AbstractString && return String[String(value)]
     if value isa AbstractVector
         audiences = String[]
@@ -216,6 +218,8 @@ function validate_time_claims!(claimset, verifier::Verifier, now_value::Real)
         iat = claim_number(claimset, "iat")
         now_s + leeway >= iat || throw(JWTClaimError(:token_issued_in_future, "jwt issued in the future"))
         if verifier.max_age !== nothing
+            # `leeway` widens the max_age window, consistent with how it relaxes exp/nbf:
+            # it absorbs clock skew on `iat` rather than tightening the freshness bound.
             now_s - iat <= verifier.max_age + leeway || throw(JWTClaimError(:token_too_old, "jwt is older than max_age"))
         end
     elseif verifier.max_age !== nothing
@@ -247,7 +251,12 @@ verify(verifier::Verifier, jwt::String) = verify(verifier, JWT(jwt))
 
 function verify(verifier::Verifier, jwt::JWT)
     issigned(jwt) || throw(JWTVerificationError(:token_unsigned, "jwt is not signed"))
-    header = decode_jwt_json_object(jwt.header)
+    header = try
+        decode_jwt_json_object(jwt.header)
+    catch err
+        err isa JWTError && rethrow()
+        throw(JWTVerificationError(:malformed_header, "jwt header is not valid base64url-encoded JSON"))
+    end
     header_alg = jwt_string_claim(header, "alg")
     header_alg === nothing && throw(JWTVerificationError(:algorithm_missing, "jwt header does not include alg"))
     header_alg in verifier.algorithms || throw(JWTVerificationError(:algorithm_disallowed, "jwt algorithm is not allowed"))
@@ -256,7 +265,12 @@ function verify(verifier::Verifier, jwt::JWT)
     key = resolve_verification_key(verifier.keyset, header_kid)
     valid = validate!(jwt, key; algorithms=verifier.algorithms)
     valid || throw(JWTVerificationError(:signature_invalid, "invalid jwt signature"))
-    claimset = decode_jwt_json_object(jwt.payload)
+    claimset = try
+        decode_jwt_json_object(jwt.payload)
+    catch err
+        err isa JWTError && rethrow()
+        throw(JWTClaimError(:malformed_payload, "jwt payload is not valid base64url-encoded JSON"))
+    end
     validate_claims!(claimset, verifier, verifier.now())
     return VerifiedJWT(jwt, header, claimset, header_kid, header_alg, key)
 end

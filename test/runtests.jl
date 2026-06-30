@@ -3,7 +3,6 @@ using JWTs: JWT, JWK, JWKSet, JWKRSA, JWKSymmetric
 using JWTs: Verifier, claims, issigned, isverified, kid, refresh!, sign!, validate!, verify, with_valid_jwt
 using Test
 using JSON
-using Base64
 
 const PUBLIC_NAMES = (
     :JWT,
@@ -112,9 +111,9 @@ function test_in_mem_keyset(template)
 end
 
 function tamper_signature(jwt::JWT)
-    sig = base64decode(JWTs.urldec(jwt.signature))
+    sig = JWTs.base64url_decode(jwt.signature)
     sig[1] = xor(sig[1], 0x01)
-    JWT(; jwt=join([jwt.header, jwt.payload, JWTs.urlenc(base64encode(sig))], "."))
+    JWT(; jwt=join([jwt.header, jwt.payload, JWTs.base64url_encode(sig)], "."))
 end
 
 mutable struct TestClock
@@ -329,25 +328,25 @@ function test_validation_state_safety(keyset_url)
     @test !validate!(jwt, keyset, other_keyid; algorithms=[JWTs.alg(key)])
     @test validate!(jwt, keyset, keyid; algorithms=[JWTs.alg(key)])
 
-    header_without_alg_or_kid = JWTs.urlenc(base64encode(JSON.json(Dict("typ" => "JWT"))))
+    header_without_alg_or_kid = JWTs.base64url_encode(JSON.json(Dict("typ" => "JWT")))
     missing_header_token = JWT(; jwt=join([header_without_alg_or_kid, jwt.payload, jwt.signature], "."))
     @test JWTs.alg(missing_header_token) === nothing
     @test kid(missing_header_token) === nothing
     @test !validate!(missing_header_token, key; algorithms=[JWTs.alg(key)])
     @test_throws ArgumentError validate!(missing_header_token, keyset; algorithms=[JWTs.alg(key)])
 
-    header_with_extensions = JWTs.urlenc(base64encode(JSON.json(Dict{String,Any}(
+    header_with_extensions = JWTs.base64url_encode(JSON.json(Dict{String,Any}(
         "alg" => JWTs.alg(key),
         "kid" => keyid,
         "typ" => "JWT",
         "crit" => ["exp"],
         "nested" => Dict("accepted" => true),
-    ))))
+    )))
     extended_header_token = JWT(; jwt=join([header_with_extensions, jwt.payload, jwt.signature], "."))
     @test JWTs.alg(extended_header_token) == JWTs.alg(key)
     @test kid(extended_header_token) == keyid
 
-    trailing_header_data = JWTs.urlenc(base64encode("""{"alg":"$(JWTs.alg(key))","kid":"$keyid"} false"""))
+    trailing_header_data = JWTs.base64url_encode("""{"alg":"$(JWTs.alg(key))","kid":"$keyid"} false""")
     trailing_header_token = JWT(; jwt=join([trailing_header_data, jwt.payload, jwt.signature], "."))
     @test_throws ArgumentError JWTs.alg(trailing_header_token)
     @test_throws ArgumentError kid(trailing_header_token)
@@ -629,8 +628,8 @@ end
             "alg" => "ES256",
             "use" => "sig",
             "crv" => "P-256",
-            "x" => JWTs.urlenc(base64encode(UInt8[0x01])),
-            "y" => JWTs.urlenc(base64encode(UInt8[0x02])),
+            "x" => JWTs.base64url_encode(UInt8[0x01]),
+            "y" => JWTs.base64url_encode(UInt8[0x02]),
         )]
         JWTs.refresh!(bad_ec, keysetdict)
         @test isempty(keysetdict)
@@ -641,9 +640,58 @@ end
             "alg" => "EdDSA",
             "use" => "sig",
             "crv" => "Ed25519",
-            "x" => JWTs.urlenc(base64encode(UInt8[0x01])),
+            "x" => JWTs.base64url_encode(UInt8[0x01]),
         )]
         JWTs.refresh!(bad_okp, keysetdict)
         @test isempty(keysetdict)
+    end
+
+    @testset "hardening" begin
+        # strict base64url decoding: canonical round-trips, everything else is rejected
+        @test JWTs.base64url_decode(JWTs.base64url_encode(UInt8[0x00, 0x01, 0xfe, 0xff])) == UInt8[0x00, 0x01, 0xfe, 0xff]
+        @test_throws ArgumentError JWTs.base64url_decode("ab+c")   # standard-base64 '+'
+        @test_throws ArgumentError JWTs.base64url_decode("ab/c")   # standard-base64 '/'
+        @test_throws ArgumentError JWTs.base64url_decode("YQ=x")   # '=' before the end
+        @test_throws ArgumentError JWTs.base64url_decode("YQABC")  # length % 4 == 1
+        @test_throws ArgumentError JWTs.base64url_decode("QB")     # non-zero trailing bits
+
+        @test JWTs.is_http_url("https://issuer.example/keys")
+        @test JWTs.is_http_url("http://issuer.example/keys")
+        @test !JWTs.is_http_url("file:///etc/passwd")
+
+        # a remote JWKS must not yield a symmetric (forge-able) key
+        secret = collect(codeunits("remote-symmetric-secret"))
+        sym_doc = Dict("keys" => [Dict("kid" => "sym1", "kty" => "oct", "alg" => "HS256", "k" => JWTs.base64url_encode(secret))])
+        sym_verifier = Verifier(; jwks_uri="https://issuer.example/keys", algorithms=["HS256"], fetcher=(_ -> sym_doc), now=() -> 1000.0)
+        sym_jwt = JWT(; payload=Dict("sub" => "x"))
+        sign!(sym_jwt, JWKSymmetric("HS256", secret), "sym1")
+        @test_throws JWTs.JWKSError verify(sym_verifier, sym_jwt)
+
+        # OIDC discovery must carry an issuer and an http(s) jwks_uri
+        oidc_issuer = "https://issuer.example/oauth2/default"
+        resolvable = JWTs.base64url_encode(JSON.json(Dict("alg" => "RS256", "kid" => "k1", "typ" => "JWT"))) * "." *
+            JWTs.base64url_encode(JSON.json(Dict("sub" => "x"))) * "." * JWTs.base64url_encode(UInt8[0x00])
+        no_issuer = Verifier(oidc_issuer; algorithms=["RS256"], fetcher=(_ -> Dict("jwks_uri" => "https://issuer.example/keys")), now=() -> 1000.0)
+        @test_throws JWTs.JWKSError verify(no_issuer, resolvable)
+        file_jwks = Verifier(oidc_issuer; algorithms=["RS256"], fetcher=(_ -> Dict("issuer" => oidc_issuer, "jwks_uri" => "file:///etc/passwd")), now=() -> 1000.0)
+        @test_throws JWTs.JWKSError verify(file_jwks, resolvable)
+
+        # the verifier surfaces typed errors for malformed tokens and missing expected claims
+        oct_keyset = JWKSet("file://" * joinpath(@__DIR__, "keys", "oct", "jwkkey.json"))
+        refresh!(oct_keyset)
+        oct_kid = first(k for (k, v) in oct_keyset.keys if JWTs.alg(v) == "HS256")
+        signed_token = JWT(; payload=Dict("sub" => "s"))
+        sign!(signed_token, oct_keyset, oct_kid)
+        plain_verifier = Verifier(oct_keyset; algorithms=["HS256"], now=() -> 1000.0)
+        @test_throws JWTs.JWTVerificationError verify(plain_verifier, "a*b.c.d")
+        issuer_verifier = Verifier(oct_keyset; algorithms=["HS256"], issuer="https://issuer.example", now=() -> 1000.0)
+        missing_iss_err = try
+            verify(issuer_verifier, signed_token)
+            nothing
+        catch e
+            e
+        end
+        @test missing_iss_err isa JWTs.JWTClaimError
+        @test missing_iss_err.code === :claim_missing
     end
 end

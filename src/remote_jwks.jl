@@ -86,6 +86,10 @@ function is_absolute_url(url::AbstractString)
     return occursin(r"^[A-Za-z][A-Za-z0-9+.-]*://", String(url))
 end
 
+function is_http_url(url::AbstractString)
+    return occursin(r"^https?://"i, String(url))
+end
+
 function openid_configuration_url(issuer::AbstractString, discovery_path::AbstractString="/.well-known/openid-configuration")
     path = String(discovery_path)
     is_absolute_url(path) && return path
@@ -176,7 +180,9 @@ function refresh_remote_jwks_unlocked!(source::RemoteJWKSet, now_value::Float64;
     try
         doc = fetch_json_document(source.fetcher, source.jwks_uri)
         keys = Dict{String,JWK}()
-        refresh!(jwks_keys(doc, source.jwks_uri), keys; default_algs=source.default_algs)
+        # A remote JWKS endpoint publishes only public keys; a symmetric ("oct") secret
+        # arriving from one is a misconfiguration or attacker-controlled forge-able key.
+        refresh!(jwks_keys(doc, source.jwks_uri), keys; default_algs=source.default_algs, allow_symmetric=false)
         source.keyset.keys = keys
         source.keyset.url = source.jwks_uri
         source.fetched_at = now_value
@@ -211,9 +217,14 @@ function refresh!(source::RemoteJWKSet)
 end
 
 function resolve_verification_key(keyset::JWKSet, keyid::String)
-    haskey(keyset.keys, keyid) || refresh!(keyset)
-    haskey(keyset.keys, keyid) || throw(JWKSError(:key_not_found, "JWK set does not contain key id $keyid"))
-    return keyset.keys[keyid]
+    lock(keyset.lock)
+    try
+        haskey(keyset.keys, keyid) || refresh!(keyset)
+        haskey(keyset.keys, keyid) || throw(JWKSError(:key_not_found, "JWK set does not contain key id $keyid"))
+        return keyset.keys[keyid]
+    finally
+        unlock(keyset.lock)
+    end
 end
 
 function resolve_verification_key(source::RemoteJWKSet, keyid::String)
@@ -244,13 +255,18 @@ function refresh_oidc_discovery_unlocked!(source::OIDCDiscovery, now_value::Floa
     try
         metadata = fetch_json_document(source.fetcher, source.discovery_uri)
         metadata isa AbstractDict || throw(JWKSError(:oidc_invalid, "OIDC discovery document must be a JSON object"))
-        discovered_issuer = get(metadata, "issuer", source.issuer)
-        discovered_issuer isa AbstractString || throw(JWKSError(:oidc_invalid, "OIDC discovery issuer must be a string"))
+        # RFC 8414 requires the discovery document to carry `issuer`; do not default it,
+        # or a metadata document that simply omits it would pass the binding check.
+        discovered_issuer = get(metadata, "issuer", nothing)
+        discovered_issuer isa AbstractString || throw(JWKSError(:oidc_invalid, "OIDC discovery document is missing issuer"))
         rstrip(String(discovered_issuer), '/') == source.issuer ||
             throw(JWKSError(:oidc_issuer_mismatch, "OIDC discovery issuer does not match configured issuer"))
         jwks_uri = get(metadata, "jwks_uri", nothing)
         jwks_uri isa AbstractString || throw(JWKSError(:oidc_invalid, "OIDC discovery document is missing jwks_uri"))
         isempty(jwks_uri) && throw(JWKSError(:oidc_invalid, "OIDC discovery jwks_uri must not be empty"))
+        # The jwks_uri comes from a fetched document; keep it on http(s) so it cannot
+        # redirect the default fetcher to file:// or other local schemes.
+        is_http_url(jwks_uri) || throw(JWKSError(:oidc_invalid, "OIDC discovery jwks_uri must be an http(s) URL"))
         if source.jwks === nothing || source.jwks.jwks_uri != String(jwks_uri)
             source.jwks = RemoteJWKSet(
                 jwks_uri;
