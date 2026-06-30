@@ -1,0 +1,58 @@
+{
+    "keys": [
+        {
+            "kid": "es256-1",
+            "kty": "EC",
+            "alg": "ES256",
+            "use": "sig",
+            "crv": "P-256",
+            "x": "eo8SWbQJnjRIcaAY0MLF7TCbU4fe5Hotjl8EmYAyQS8",
+            "y": "qFKOPlQtc7OvUNEgl2_Tch-7HfQrHz2WYFNTbDZu-hg"
+        },
+        {
+            "kid": "es256-2",
+            "kty": "EC",
+            "alg": "ES256",
+            "use": "sig",
+            "crv": "P-256",
+            "x": "H9nQR7sbQyV1amY41_sY977JJE56nwE6yV3OBAcMag8",
+            "y": "RV4lTE0fvSB3682ksH3FckM7Xf-f2d_C4hty_MYlnlw"
+        },
+        {
+            "kid": "es384-1",
+            "kty": "EC",
+            "alg": "ES384",
+            "use": "sig",
+            "crv": "P-384",
+            "x": "lqP3QSfvJ05Uj_X1vtFC0cSRaf95QsWEgyDrx0pe1qX2Q7nXJagGFB1Yi5qA4GJK",
+            "y": "OO1CFFUg1sm9jfm06iIm_SBXWF4Qx6JBuf4yHzDQQDOIJAgpbh5jc7MBuKFppAVz"
+        },
+        {
+            "kid": "es384-2",
+            "kty": "EC",
+            "alg": "ES384",
+            "use": "sig",
+            "crv": "P-384",
+            "x": "0pt1FgwrXKsOc-A7DUAMgavjiLR3CsEVNF4x8QqH1J69F_9j3P0bneeSSCIQ3Lev",
+            "y": "qsLvDDghDqWCLuHX3MWiKRTdTBi4YDlpBwoUg8Un1k7aZVaGTNZLWb3Q_2aC8OEc"
+        },
+        {
+            "kid": "es512-1",
+            "kty": "EC",
+            "alg": "ES512",
+            "use": "sig",
+            "crv": "P-521",
+            "x": "AADzLigEkmGVsdDymDXKTNlhz35egTzQ37scqoz3Dmku3RI53Ir4jg8APwQvN1GAc0KVn2ime6475n6mwGyXbKSg",
+            "y": "AYJ1O6y4xlzFoQCoPBETrm5KHrCaNt-d1BOwOvjbnRpQ5TTregHh2x-ewKAiQiC0jhMLyIF53kV8NEWSREVu7QFE"
+        },
+        {
+            "kid": "es512-2",
+            "kty": "EC",
+            "alg": "ES512",
+            "use": "sig",
+            "crv": "P-521",
+            "x": "AKKfHaU0rI1qFKtIZch96rEScmIEr4uGMPCLE3BbkHi0_bXIY42TtzX0yNs_LNQBUZADppz2EZsIghwpBMk0yWKT",
+            "y": "AEspZh9BCdJ2KR-l9XqIDnb08QEXdUo03rVO1pQCU42OWpQ7qCndUZdqQrwraiCe1-CqAFfsuMC8VWHyXcl6QWUi"
+        }
+    ]
+}

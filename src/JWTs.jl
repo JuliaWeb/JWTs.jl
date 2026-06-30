@@ -1,35 +1,96 @@
 module JWTs
 
-using MbedTLS
 using JSON
-using Base64
 using Downloads
-using Random
+using OpenSSL_jll
+using SHA
 
-import Base: show, isvalid
-export JWT, JWK, JWKRSA, JWKSymmetric, JWKSet
-export issigned, isverified, isvalid
-export validate!, sign!, refresh!
-export show, claims, kid
-export with_valid_jwt
+include("errors.jl")
+include("crypto.jl")
+
+import Base: getproperty, setproperty!, show, isvalid
+
+if VERSION >= v"1.11"
+    Core.eval(@__MODULE__, Expr(:public,
+        :JWT,
+        :JWK,
+        :JWKSet,
+        :JWKRSA,
+        :JWKEC,
+        :JWKOKP,
+        :JWKSymmetric,
+        :Verifier,
+        :VerifiedJWT,
+        :JWTError,
+        :JWTVerificationError,
+        :JWTClaimError,
+        :JWKSError,
+        :parse_keyfile,
+        :claims,
+        :kid,
+        :alg,
+        :issigned,
+        :isverified,
+        :isvalid,
+        :sign!,
+        :validate!,
+        :refresh!,
+        :with_valid_jwt,
+        :verify,
+    ))
+end
 
 struct JWKSymmetric
-    kind::MbedTLS.MDKind
+    alg::String
     key::Vector{UInt8}
+
+    function JWKSymmetric(alg::AbstractString, key::AbstractVector{UInt8})
+        alg in HMAC_ALGORITHMS || throw(ArgumentError("unsupported symmetric key algorithm: $alg"))
+        new(String(alg), Vector{UInt8}(key))
+    end
 end
 
 struct JWKRSA
-    kind::MbedTLS.MDKind
-    key::Union{RSA,MbedTLS.PKContext}
+    alg::String
+    key::OpenSSLKey
+
+    function JWKRSA(alg::AbstractString, key::OpenSSLKey)
+        alg in RSA_ALGORITHMS || throw(ArgumentError("unsupported RSA key algorithm: $alg"))
+        new(String(alg), key)
+    end
+end
+
+struct JWKEC
+    alg::String
+    key::OpenSSLKey
+    crv::String
+
+    function JWKEC(alg::AbstractString, key::OpenSSLKey, crv::AbstractString)
+        alg in EC_ALGORITHMS || throw(ArgumentError("unsupported EC key algorithm: $alg"))
+        alg == alg_for_curve(crv) || throw(ArgumentError("EC algorithm $alg does not match curve $crv"))
+        new(String(alg), key, String(crv))
+    end
+end
+
+struct JWKOKP
+    alg::String
+    key::OpenSSLKey
+    crv::String
+
+    function JWKOKP(alg::AbstractString, key::OpenSSLKey, crv::AbstractString)
+        alg in OKP_ALGORITHMS || throw(ArgumentError("unsupported OKP key algorithm: $alg"))
+        alg == alg_for_curve(crv) || throw(ArgumentError("OKP algorithm $alg does not match curve $crv"))
+        new(String(alg), key, String(crv))
+    end
 end
 
 """
 JWK represents a JWK Key (either for signing or verification).
 
-JWK can be either a JWKRSA or JWKSymmetric. A RSA key can
+JWK can be a JWKRSA, JWKEC, JWKOKP, or JWKSymmetric. An asymmetric key can
 represent either the public or private key.
 """
-const JWK = Union{JWKRSA,JWKSymmetric}
+const JWK = Union{JWKRSA,JWKEC,JWKOKP,JWKSymmetric}
 
 """
 JWKSet holds a set of keys, fetched from a OpenId key URL, each key identified by a key id.
@@ -39,15 +100,16 @@ The key URL can either be of `http(s)://` or `file://` type.
 mutable struct JWKSet
     url::String
     keys::Dict{String,JWK}
+    lock::ReentrantLock
 
     function JWKSet(url::String)
-        new(url, Dict{String,JWK}())
+        new(url, Dict{String,JWK}(), ReentrantLock())
     end
 
     function JWKSet(keyset::Vector)
         keysetdict = Dict{String,JWK}()
         refresh!(keyset, keysetdict)
-        new("", keysetdict)
+        new("", keysetdict, ReentrantLock())
     end
 end
 function show(io::IO, jwk::JWKSet)
@@ -61,30 +123,118 @@ JWT represents a JWT payload at the minimum.
 When signed, it holds the header and signature too.
 The parts are stored in encoded form.
 """
-mutable struct JWT
+struct JWTParts
     payload::String
     header::Union{Nothing,String}
     signature::Union{Nothing,String}
-    verified::Bool
-    valid::Union{Nothing,Bool}
+end
+
+mutable struct JWT
+    _parts::JWTParts
+    _verified::Bool
+    _valid::Union{Nothing,Bool}
 
     function JWT(; jwt::Union{Nothing,String}=nothing, payload=nothing)
         if jwt !== nothing
             (payload === nothing) || throw(ArgumentError("payload must be nothing if jwt is provided"))
-            parts = split(jwt, ".")
+            parts = split(jwt, "."; keepempty=true)
             if length(parts) == 3
-                new(parts[2], parts[1], parts[3], false, nothing)
+                new(JWTParts(parts[2], parts[1], parts[3]), false, nothing)
             else
-                new("", nothing, nothing, true, false)
+                new(JWTParts("", nothing, nothing), true, false)
             end
         else
             (payload !== nothing) || throw(ArgumentError("payload must be provided if jwt is not"))
-            new(isa(payload, String) ? payload : urlenc(base64encode(JSON.json(payload))), nothing, nothing, false, nothing)
+            encoded_payload = isa(payload, String) ? payload : base64url_encode(JSON.json(payload))
+            new(JWTParts(encoded_payload, nothing, nothing), false, nothing)
         end
     end
 end
+JWT(jwt::String) = JWT(; jwt=jwt)
 
-decodepart(encoded::String) = JSON.parse(String(base64decode(urldec(encoded))))
+function getproperty(jwt::JWT, name::Symbol)
+    if name === :payload
+        return getfield(jwt, :_parts).payload
+    elseif name === :header
+        return getfield(jwt, :_parts).header
+    elseif name === :signature
+        return getfield(jwt, :_parts).signature
+    elseif name === :verified
+        return getfield(jwt, :_verified)
+    elseif name === :valid
+        return getfield(jwt, :_valid)
+    else
+        return getfield(jwt, name)
+    end
+end
+
+function jwt_encoded_part(value, name::Symbol)::String
+    value isa AbstractString || throw(ArgumentError("JWT.$name must be a string"))
+    return String(value)
+end
+
+function jwt_optional_encoded_part(value, name::Symbol)::Union{Nothing,String}
+    value === nothing && return nothing
+    return jwt_encoded_part(value, name)
+end
+
+function setproperty!(jwt::JWT, name::Symbol, value)
+    if name === :payload
+        parts = getfield(jwt, :_parts)
+        setparts!(jwt, JWTParts(jwt_encoded_part(value, name), parts.header, parts.signature); verified=false, valid=nothing)
+    elseif name === :header
+        parts = getfield(jwt, :_parts)
+        setparts!(jwt, JWTParts(parts.payload, jwt_optional_encoded_part(value, name), parts.signature); verified=false, valid=nothing)
+    elseif name === :signature
+        parts = getfield(jwt, :_parts)
+        setparts!(jwt, JWTParts(parts.payload, parts.header, jwt_optional_encoded_part(value, name)); verified=false, valid=nothing)
+    elseif name === :verified || name === :valid
+        throw(ArgumentError("JWT.$name is read-only; call sign! or validate! to update validation state"))
+    else
+        setfield!(jwt, name, value)
+    end
+    return value
+end
+
+function setvalidation!(jwt::JWT, valid::Union{Nothing,Bool})
+    setfield!(jwt, :_verified, valid !== nothing)
+    setfield!(jwt, :_valid, valid)
+    return valid
+end
+
+function setparts!(jwt::JWT, parts::JWTParts; verified::Bool=false, valid::Union{Nothing,Bool}=nothing)
+    setfield!(jwt, :_parts, parts)
+    setfield!(jwt, :_verified, verified)
+    setfield!(jwt, :_valid, valid)
+    return jwt
+end
+
+const JWTJSONDict = Dict{String,Any}
+
+function decodepart(encoded::String)
+    json = String(base64url_decode(encoded))
+    try
+        return JSON.parse(json; dicttype=JWTJSONDict)
+    catch
+        throw(ArgumentError("JWT part must contain valid JSON"))
+    end
+end
+
+function decode_jwt_json_object(encoded::String)::JWTJSONDict
+    value = decodepart(encoded)
+    value isa JWTJSONDict || throw(ArgumentError("JWT part must be a JSON object"))
+    return value
+end
+
+function jwt_string_claim(claims::AbstractDict, claim::String)::Union{Nothing,String}
+    value = get(claims, claim, nothing)
+    value isa String || return nothing
+    return value
+end
+
+function jwt_header_string_claim(encoded::String, claim::String)::Union{Nothing,String}
+    return jwt_string_claim(decode_jwt_json_object(encoded), claim)
+end
 
 """
     claims(jwt::JWT)
@@ -111,9 +261,9 @@ Get the key id from the JWT header, or `nothing` if the `kid` parameter is not i
 
 The JWT must be signed. An exception is thrown otherwise.
 """
-function kid(jwt::JWT)::String
+function kid(jwt::JWT)::Union{Nothing,String}
     issigned(jwt) || throw(ArgumentError("jwt is not signed"))
-    get(decodepart(jwt.header), "kid", nothing)
+    return jwt_header_string_claim(jwt.header, "kid")
 end
 
 """
@@ -123,9 +273,9 @@ Get the key algorithm from the JWT header, or `nothing` if the `alg` parameter i
 
 The JWT must be signed. An exception is thrown otherwise.
 """
-function alg(jwt::JWT)::String
+function alg(jwt::JWT)::Union{Nothing,String}
     issigned(jwt) || throw(ArgumentError("jwt is not signed"))
-    get(decodepart(jwt.header), "alg", nothing)
+    return jwt_header_string_claim(jwt.header, "alg")
 end
 
 """
@@ -133,15 +283,36 @@ end
 
 Get the key algorithm from the JWK key as a string.
 
-Supported algorithms are "RS256", "RS384", "RS512", "HS256", "HS384", and "HS512".
+Supported algorithms are "HS256", "HS384", "HS512", "RS256", "RS384", "RS512",
+"PS256", "PS384", "PS512", "ES256", "ES384", "ES512", and "EdDSA".
 An `ArgumentError` is thrown for unsupported algorithms.
 """
 function alg(key::JWK)
-    kind = key.kind
-    if !(kind === MbedTLS.MD_SHA256 || kind === MbedTLS.MD_SHA384 || kind === MbedTLS.MD_SHA)
-        throw(ArgumentError("unsupported key algorithm: $(kind)"))
+    return key.alg
+end
+
+function signbytes(key::JWK, data::AbstractString)
+    if key isa JWKSymmetric
+        return hmac_digest(alg(key), key.key, data)
+    elseif key isa JWKRSA
+        return evp_digest_sign(key.key, alg(key), data)
+    elseif key isa JWKEC
+        return sign_ec(key.key, alg(key), data)
+    else
+        return sign_okp(key.key, alg(key), data)
     end
-    return string(key isa JWKRSA ? "RS" : "HS", MbedTLS.get_size(kind) << 3)
+end
+
+function verifybytes(key::JWK, data::AbstractString, signature::AbstractVector{UInt8})
+    if key isa JWKSymmetric
+        return constant_time_equal(hmac_digest(alg(key), key.key, data), signature)
+    elseif key isa JWKRSA
+        return evp_digest_verify(key.key, alg(key), data, signature)
+    elseif key isa JWKEC
+        return verify_ec(key.key, alg(key), data, signature)
+    else
+        return verify_okp(key.key, alg(key), data, signature)
+    end
 end
 
 show(io::IO, jwt::JWT) = print(io, issigned(jwt) ? join([jwt.header, jwt.payload, jwt.signature], '.') : jwt.payload)
@@ -156,38 +327,40 @@ The optional `algorithms` parameter can be used to specify the algorithms to use
 
 Returns `true` if the JWT is valid, `false` otherwise.
 """
-validate!(jwt::JWT, keyset::JWKSet; algorithms::Vector{String}=String[]) = validate!(jwt, keyset, kid(jwt); algorithms=algorithms)
+function validate!(jwt::JWT, keyset::JWKSet; algorithms::Vector{String}=String[])
+    keyid = kid(jwt)
+    keyid === nothing && throw(ArgumentError("jwt header does not include kid"))
+    validate!(jwt, keyset, keyid; algorithms=algorithms)
+end
 function validate!(jwt::JWT, keyset::JWKSet, kid::String; algorithms::Vector{String}=String[])
-    isverified(jwt) && (return isvalid(jwt))
     (kid in keys(keyset.keys)) || refresh!(keyset)
     validate!(jwt, keyset.keys[kid]; algorithms=algorithms)
 end
 function validate!(jwt::JWT, key::JWK; algorithms::Vector{String}=String[])
-    isverified(jwt) && (return isvalid(jwt))
     issigned(jwt) || throw(ArgumentError("jwt is not signed"))
 
     data = jwt.header * "." * jwt.payload
-    sigbytes = base64decode(urldec(jwt.signature))
+    sigbytes = try
+        base64url_decode(jwt.signature)
+    catch
+        return setvalidation!(jwt, false)
+    end
 
-    jwt.verified = true
     # Check that the (optional) `alg` header claim matches the algorithm of the validation key
     alg_jwt = alg(jwt)
-    valid_alg = alg_jwt === nothing || alg_jwt == alg(key)
+    alg_jwt === nothing && return setvalidation!(jwt, false)
+    valid_alg = alg_jwt == alg(key)
     if !isempty(algorithms)
-        alg_matched = alg_jwt === nothing ? alg(key) : alg_jwt
-        if !(alg_matched in algorithms)
-            return false
+        if !(alg_jwt in algorithms)
+            return setvalidation!(jwt, false)
         end
     end
-    jwt.valid = valid_alg && if key isa JWKRSA
-        try
-            MbedTLS.verify(key.key, key.kind, MbedTLS.digest(key.kind, data), sigbytes) == 0
-        catch
-            false
-        end
-    else
-        MbedTLS.digest(key.kind, data, key.key) == sigbytes
+    valid = valid_alg && try
+        verifybytes(key, data, sigbytes)
+    catch
+        false
     end
+    return setvalidation!(jwt, valid)
 end
 
 """
@@ -225,16 +398,13 @@ function sign!(jwt::JWT, key::JWK, kid::String="")
 
     header_dict = Dict{String,String}("alg"=>alg(key), "typ"=>"JWT")
     isempty(kid) || (header_dict["kid"] = kid)
-    header = urlenc(base64encode(JSON.json(header_dict)))
+    header = base64url_encode(JSON.json(header_dict))
 
     data = header * "." * jwt.payload
-    sigbytes = key isa JWKRSA ?  MbedTLS.sign(key.key, key.kind, MbedTLS.digest(key.kind, data), MersenneTwister()) : MbedTLS.digest(key.kind, data, key.key)
-    signature = urlenc(base64encode(sigbytes))
+    sigbytes = signbytes(key, data)
+    signature = base64url_encode(sigbytes)
 
-    jwt.header = header
-    jwt.signature = signature
-    jwt.verified = true
-    jwt.valid = true
+    setparts!(jwt, JWTParts(jwt.payload, header, signature); verified=true, valid=true)
     nothing
 end
 
@@ -257,61 +427,108 @@ If the keyseturl is not specified, the keyset is refreshed with the keys from th
 The default algorithm values are referred to only if the keyset does not specify the exact algorithm type.
 E.g. if only "RSA" is specified as the algorithm, "RS256" will be assumed.
 """
-function refresh!(keyset::JWKSet, keyseturl::String; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing)
+function refresh!(keyset::JWKSet, keyseturl::String; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing, fetcher=nothing, allow_symmetric=nothing)
     keyset.url = keyseturl
-    refresh!(keyset; default_algs=default_algs, downloader=downloader)
+    refresh!(keyset; default_algs=default_algs, downloader=downloader, fetcher=fetcher, allow_symmetric=allow_symmetric)
 end
 
-function refresh!(keyset::JWKSet; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing)
+function refresh!(keyset::JWKSet; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing, fetcher=nothing, allow_symmetric=nothing)
     if !isempty(keyset.url)
         keys = Dict{String,JWK}()
-        refresh!(keyset.url, keys; default_algs=default_algs, downloader=downloader)
+        refresh!(keyset.url, keys; default_algs=default_algs, downloader=downloader, fetcher=fetcher, allow_symmetric=allow_symmetric)
         keyset.keys = keys
     end
     nothing
 end
 
-function refresh!(keyseturl::String, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing)
-    if startswith(keyseturl, "file://")
-        jstr = readchomp(keyseturl[8:end])
+function jwks_document(raw, url::String)
+    if raw isa AbstractDict
+        return raw
+    elseif raw isa AbstractString
+        return JSON.parse(String(raw))
+    elseif raw isa AbstractVector{UInt8}
+        return JSON.parse(String(raw))
     else
-        output = PipeBuffer()
-        Downloads.request(keyseturl; method="GET", output=output, downloader=downloader)
-        jstr = String(take!(output))
+        throw(ArgumentError("unsupported JWKS document result from $url: $(typeof(raw))"))
     end
-    keys = JSON.parse(jstr)["keys"]
-    refresh!(keys, keysetdict; default_algs=default_algs)
 end
 
-function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"))
+function fetch_url(url::String; downloader=nothing)
+    if startswith(url, "file://")
+        return readchomp(url[8:end])
+    else
+        output = PipeBuffer()
+        response = Downloads.request(url; method="GET", output=output, downloader=downloader)
+        # Downloads.request only throws on transport-level errors, not on HTTP error
+        # status codes, so a 4xx/5xx error page would otherwise be parsed as a keyset.
+        if response isa Downloads.Response && !(200 <= response.status < 300)
+            throw(ErrorException("failed to fetch $url: HTTP status $(response.status)"))
+        end
+        return String(take!(output))
+    end
+end
+
+function refresh!(keyseturl::String, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing, fetcher=nothing, allow_symmetric=nothing)
+    raw = fetcher === nothing ? fetch_url(keyseturl; downloader=downloader) : fetcher(keyseturl)
+    keys = jwks_document(raw, keyseturl)["keys"]
+    allow_symmetric = something(allow_symmetric, !is_http_url(keyseturl))
+    refresh!(keys, keysetdict; default_algs=default_algs, allow_symmetric=allow_symmetric)
+end
+
+function default_jwk_alg(key, default_algs)
+    haskey(key, "alg") && return key["alg"]
+    kty = key["kty"]
+    if kty in ("EC", "OKP")
+        return alg_for_curve(key["crv"])
+    else
+        return get(default_algs, kty, "none")
+    end
+end
+
+function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), allow_symmetric::Bool=true)
     for key in keys
         kid = key["kid"]
         kty = key["kty"]
-        alg = get(key, "alg", get(default_algs, kty, "none"))
+        alg = default_jwk_alg(key, default_algs)
 
         # ref: https://tools.ietf.org/html/rfc7518
         try
             if kty == "RSA"
-                n = base64decode(urldec(key["n"]))
-                e = base64decode(urldec(key["e"]))
-                if alg == "RS256"
-                    keysetdict[kid] = JWKRSA(MbedTLS.MD_SHA256, pubkey(n, e, MbedTLS.MD_SHA256))
-                elseif alg == "RS384"
-                    keysetdict[kid] = JWKRSA(MbedTLS.MD_SHA384, pubkey(n, e, MbedTLS.MD_SHA384))
-                elseif alg == "RS512"
-                    keysetdict[kid] = JWKRSA(MbedTLS.MD_SHA, pubkey(n, e, MbedTLS.MD_SHA))
+                n = base64url_decode(key["n"])
+                e = base64url_decode(key["e"])
+                if alg in RSA_ALGORITHMS
+                    keysetdict[kid] = JWKRSA(alg, rsa_public_key(n, e))
                 else
                     @warn("key alg $alg not supported yet, skipping key $kid")
                     continue
                 end
             elseif kty == "oct"
-                k = base64decode(urldec(key["k"]))
-                if alg == "HS256"
-                    keysetdict[kid] = JWKSymmetric(MbedTLS.MD_SHA256, k)
-                elseif alg == "HS384"
-                    keysetdict[kid] = JWKSymmetric(MbedTLS.MD_SHA384, k)
-                elseif alg == "HS512"
-                    keysetdict[kid] = JWKSymmetric(MbedTLS.MD_SHA, k)
+                if !allow_symmetric
+                    @warn("symmetric keys are not accepted from this key source, skipping key $kid")
+                    continue
+                end
+                k = base64url_decode(key["k"])
+                if alg in HMAC_ALGORITHMS
+                    keysetdict[kid] = JWKSymmetric(alg, k)
+                else
+                    @warn("key alg $alg not supported yet, skipping key $kid")
+                    continue
+                end
+            elseif kty == "EC"
+                crv = key["crv"]
+                x = base64url_decode(key["x"])
+                y = base64url_decode(key["y"])
+                if alg in EC_ALGORITHMS
+                    keysetdict[kid] = JWKEC(alg, ec_public_key(crv, x, y), crv)
+                else
+                    @warn("key alg $alg not supported yet, skipping key $kid")
+                    continue
+                end
+            elseif kty == "OKP"
+                crv = key["crv"]
+                x = base64url_decode(key["x"])
+                if alg in OKP_ALGORITHMS
+                    keysetdict[kid] = JWKOKP(alg, okp_public_key(crv, x), crv)
                 else
                     @warn("key alg $alg not supported yet, skipping key $kid")
                     continue
@@ -320,40 +537,92 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                 @warn("key type $kty not supported yet, skipping key $kid")
                 continue
             end
-        catch ex
-            @warn("exception $ex trying to decode, skipping key $kid")
+        catch
+            @warn("exception trying to decode, skipping key $kid")
         end
     end
     nothing
 end
 
-function pubkey(bytesn, bytese, halg)
-    n = parse(BigInt, bytes2hex(bytesn); base=16)
-    e = parse(BigInt, bytes2hex(bytese); base=16)
+const BASE64URL_ENCODE_TABLE = codeunits("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+const BASE64URL_INVALID = Int16(-1)
 
-    R = RSA(MbedTLS.MBEDTLS_RSA_PKCS_V15, halg)
-    MbedTLS.pubkey_from_vals!(R, e, n)
+function base64url_value(c::UInt8)::Int16
+    UInt8('A') <= c <= UInt8('Z') && return Int16(c - UInt8('A'))
+    UInt8('a') <= c <= UInt8('z') && return Int16(c - UInt8('a') + 26)
+    UInt8('0') <= c <= UInt8('9') && return Int16(c - UInt8('0') + 52)
+    c == UInt8('-') && return Int16(62)
+    c == UInt8('_') && return Int16(63)
+    return BASE64URL_INVALID
 end
 
-function urldec(bs)
-    bs = replace(bs, "-"=>"+")
-    bs = replace(bs, "_"=>"/")
-    padb64(bs)
-end
-
-function urlenc(bs)
-    bs = replace(bs, "+"=>"-")
-    bs = replace(bs, "/"=>"_")
-    bs = replace(bs, "="=>"")
-    bs
-end
-
-function padb64(bs)
-    surplus = length(bs) % 4
-    if surplus > 0
-        bs = bs * "="^(4 - surplus)
+function base64url_encode(data::AbstractVector{UInt8})::String
+    bytes = data
+    out = UInt8[]
+    sizehint!(out, cld(length(bytes) * 4, 3))
+    i = firstindex(bytes)
+    last_i = lastindex(bytes)
+    while i <= last_i
+        b1 = bytes[i]
+        if i == last_i
+            push!(out, BASE64URL_ENCODE_TABLE[(b1 >> 2) + 1])
+            push!(out, BASE64URL_ENCODE_TABLE[((b1 & 0x03) << 4) + 1])
+            break
+        end
+        b2 = bytes[i + 1]
+        if i + 1 == last_i
+            push!(out, BASE64URL_ENCODE_TABLE[(b1 >> 2) + 1])
+            push!(out, BASE64URL_ENCODE_TABLE[(((b1 & 0x03) << 4) | (b2 >> 4)) + 1])
+            push!(out, BASE64URL_ENCODE_TABLE[((b2 & 0x0f) << 2) + 1])
+            break
+        end
+        b3 = bytes[i + 2]
+        push!(out, BASE64URL_ENCODE_TABLE[(b1 >> 2) + 1])
+        push!(out, BASE64URL_ENCODE_TABLE[(((b1 & 0x03) << 4) | (b2 >> 4)) + 1])
+        push!(out, BASE64URL_ENCODE_TABLE[(((b2 & 0x0f) << 2) | (b3 >> 6)) + 1])
+        push!(out, BASE64URL_ENCODE_TABLE[(b3 & 0x3f) + 1])
+        i += 3
     end
-    bs
+    return String(out)
+end
+
+base64url_encode(data::AbstractString)::String = base64url_encode(collect(codeunits(data)))
+
+function base64url_decode(data::AbstractString)::Vector{UInt8}
+    bytes = codeunits(data)
+    byte_len = length(bytes)
+    n = byte_len
+    # Tolerate canonical trailing '=' padding, but reject excess or interior padding.
+    padding_start = findfirst(==(UInt8('=')), bytes)
+    if padding_start !== nothing
+        for i in padding_start:byte_len
+            bytes[i] == UInt8('=') || throw(ArgumentError("invalid base64url padding"))
+        end
+        n = padding_start - 1
+        padding_count = byte_len - n
+        remainder = n % 4
+        expected_padding = remainder == 0 ? 0 : 4 - remainder
+        padding_count == expected_padding || throw(ArgumentError("invalid base64url padding"))
+    end
+    out = UInt8[]
+    sizehint!(out, (n * 3) >>> 2)
+    buffer = UInt32(0)
+    bits = 0
+    @inbounds for i in 1:n
+        value = base64url_value(bytes[i])
+        value == BASE64URL_INVALID && throw(ArgumentError("invalid base64url character"))
+        buffer = (buffer << 6) | UInt32(value)
+        bits += 6
+        if bits >= 8
+            bits -= 8
+            push!(out, UInt8((buffer >> bits) & 0xff))
+        end
+    end
+    # A 6-bit remainder means length % 4 == 1, which cannot encode any byte.
+    bits == 6 && throw(ArgumentError("invalid base64url length"))
+    # The remaining 0/2/4 bits must be zero for a canonical base64url encoding.
+    (buffer & ((UInt32(1) << bits) - UInt32(1))) == 0 || throw(ArgumentError("non-canonical base64url padding bits"))
+    return out
 end
 
 """
@@ -381,14 +650,17 @@ function with_valid_jwt(f::Function, jwt::JWT, keyset::JWKSet;
     algorithms::Vector{String}=String[],
 )
     if isnothing(kid)
-        validate!(jwt, keyset; algorithms=algorithms)
+        valid = validate!(jwt, keyset; algorithms=algorithms)
     else
-        validate!(jwt, keyset, kid; algorithms=algorithms)
+        valid = validate!(jwt, keyset, kid; algorithms=algorithms)
     end
 
-    isvalid(jwt) || throw(ArgumentError("invalid jwt"))
+    valid || throw(ArgumentError("invalid jwt"))
 
     return f(jwt)
 end
+
+include("remote_jwks.jl")
+include("verifier.jl")
 
 end # module JWTs
