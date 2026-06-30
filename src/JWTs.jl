@@ -9,12 +9,36 @@ include("errors.jl")
 include("crypto.jl")
 
 import Base: getproperty, setproperty!, show, isvalid
-export JWT, JWK, JWKRSA, JWKSymmetric, JWKSet
-export issigned, isverified, isvalid
-export validate!, sign!, refresh!
-export show, claims, kid
-export with_valid_jwt
-export Verifier, VerifiedJWT, verify
+
+if VERSION >= v"1.11"
+    Core.eval(@__MODULE__, Expr(:public,
+        :JWT,
+        :JWK,
+        :JWKSet,
+        :JWKRSA,
+        :JWKEC,
+        :JWKOKP,
+        :JWKSymmetric,
+        :Verifier,
+        :VerifiedJWT,
+        :JWTError,
+        :JWTVerificationError,
+        :JWTClaimError,
+        :JWKSError,
+        :parse_keyfile,
+        :claims,
+        :kid,
+        :alg,
+        :issigned,
+        :isverified,
+        :isvalid,
+        :sign!,
+        :validate!,
+        :refresh!,
+        :with_valid_jwt,
+        :verify,
+    ))
+end
 
 struct JWKSymmetric
     alg::String

@@ -5,6 +5,8 @@
 
 JWTs.jl signs and verifies JSON Web Tokens (JWTs) and JSON Web Keys (JWKs). It supports local key sets, cached remote JWKS endpoints, and OpenID Connect discovery without requiring HTTP.jl.
 
+JWTs.jl intentionally exports no names. Use the `JWTs.` namespace, or explicitly import the names you want. On Julia versions that support `public`, documented APIs are marked public without being exported.
+
 ## Installation
 
 ```julia

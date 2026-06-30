@@ -1,7 +1,46 @@
 using JWTs
+using JWTs: JWT, JWK, JWKSet, JWKRSA, JWKSymmetric
+using JWTs: Verifier, claims, issigned, isverified, kid, refresh!, sign!, validate!, verify, with_valid_jwt
 using Test
 using JSON
 using Base64
+
+const PUBLIC_NAMES = (
+    :JWT,
+    :JWK,
+    :JWKSet,
+    :JWKRSA,
+    :JWKEC,
+    :JWKOKP,
+    :JWKSymmetric,
+    :Verifier,
+    :VerifiedJWT,
+    :JWTError,
+    :JWTVerificationError,
+    :JWTClaimError,
+    :JWKSError,
+    :parse_keyfile,
+    :claims,
+    :kid,
+    :alg,
+    :issigned,
+    :isverified,
+    :isvalid,
+    :sign!,
+    :validate!,
+    :refresh!,
+    :with_valid_jwt,
+    :verify,
+)
+
+@testset "public API surface" begin
+    @test all(name -> !Base.isexported(JWTs, name), PUBLIC_NAMES)
+    @test !Base.isexported(JWTs, :show)
+    if isdefined(Base, :ispublic)
+        @test all(name -> Base.ispublic(JWTs, name), PUBLIC_NAMES)
+        @test !Base.ispublic(JWTs, :show)
+    end
+end
 
 const test_payload_data = [
     JSON.parse("""{
