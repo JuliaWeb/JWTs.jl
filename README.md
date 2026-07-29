@@ -16,6 +16,34 @@ Pkg.add("JWTs")
 
 JWTs.jl supports Julia 1.6 and newer.
 
+## ⚠️ Upgrading to 1.1
+
+Two defaults changed, both toward rejecting tokens that were previously accepted.
+
+**`with_valid_jwt` now rejects expired tokens.** It previously validated only the
+signature, so a token whose `exp` passed an hour ago still reached your callback. It now
+also enforces `exp` and `nbf`, raising `JWTs.JWTClaimError` instead. If you were relying on
+signature-only behaviour, ask for it explicitly:
+
+```julia
+JWTs.with_valid_jwt(token, keyset; check_expiry=false) do jwt
+    # previous behaviour
+end
+```
+
+`JWTs.validate!` is unchanged — it remains signature-only by design, and its docstring now
+says so plainly.
+
+**An unrecognised `kid` no longer refetches the key set on every call.** A token's `kid` is
+attacker-controlled, so a stream of tokens bearing random key ids previously produced one
+outbound JWKS fetch each. `JWKSet` now applies the same refresh cooldown `RemoteJWKSet`
+already used (30s default, `JWKSet(url; refresh_cooldown=…)`, `0` restores the old
+behaviour). An explicit `JWTs.refresh!` is never rate limited.
+
+**Also in 1.1:** `verify` now accepts tokens whose header omits `kid` when the key set holds
+exactly one key, per RFC 7515 §4.1.4 — single-key issuers commonly omit it, and those tokens
+were previously rejected outright.
+
 ## Supported Algorithms
 
 JWTs.jl supports these JOSE signing algorithms:
@@ -172,14 +200,22 @@ Use `discovery_path` if your provider uses a non-default discovery document path
 
 ## Lower-Level Signature Validation
 
-`JWTs.validate!` and `JWTs.with_valid_jwt` remain available as lower-level signature validation helpers. They do not validate registered claims such as `exp`, `nbf`, `iat`, `iss`, or `aud`.
+`JWTs.validate!` checks the **signature and `alg` header only**. It does not look at registered claims, so an expired token validates successfully and `JWTs.isvalid` reports `true` for it.
 
 ```julia
 jwt = JWTs.JWT(token_string)
 JWTs.validate!(jwt, keyset, "signing-key-id"; algorithms=["RS256"])
 ```
 
-Use these helpers when you intentionally want only signature validation. `algorithms` is optional for backwards compatibility, but passing an explicit allowlist is strongly recommended. Use `JWTs.Verifier` for application authentication and authorization boundaries.
+`JWTs.with_valid_jwt` additionally rejects tokens whose `exp` has passed or whose `nbf` has not yet arrived, since a helper that hands your callback a "valid" token should not hand it an expired one:
+
+```julia
+JWTs.with_valid_jwt(token_string, keyset; algorithms=["RS256"], leeway=60) do jwt
+    # only reached for a signature-valid, unexpired token
+end
+```
+
+Pass `check_expiry=false` for the previous signature-only behaviour. Neither helper validates `iss`, `aud`, `iat`/`max_age`, or required claims — use `JWTs.Verifier` for application authentication and authorization boundaries. `algorithms` is optional on these helpers for backwards compatibility, but passing an explicit allowlist is strongly recommended.
 
 ## Errors
 

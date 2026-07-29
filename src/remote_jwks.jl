@@ -219,7 +219,7 @@ end
 function resolve_verification_key(keyset::JWKSet, keyid::String)
     lock(keyset.lock)
     try
-        haskey(keyset.keys, keyid) || refresh!(keyset)
+        refresh_for_unknown_kid!(keyset, keyid)
         haskey(keyset.keys, keyid) || throw(JWKSError(:key_not_found, "JWK set does not contain key id $keyid"))
         return keyset.keys[keyid]
     finally
@@ -308,3 +308,36 @@ end
 function resolve_verification_key(source::OIDCDiscovery, keyid::String)
     return resolve_verification_key(oidc_jwks_source!(source), keyid)
 end
+
+# RFC 7515 Section 4.1.4 makes `kid` optional, and issuers publishing a single
+# signing key routinely omit it. When the key set is unambiguous there is exactly
+# one key it could have been signed with, so use it; otherwise the token must say.
+function resolve_sole_verification_key(keyset::JWKSet)
+    lock(keyset.lock)
+    try
+        isempty(keyset.keys) && !isempty(keyset.url) && refresh!(keyset)
+        length(keyset.keys) == 1 || throw(JWTVerificationError(
+            :key_id_missing,
+            "jwt header does not include kid and the key set has $(length(keyset.keys)) keys"))
+        keyid = first(keys(keyset.keys))
+        return keyid, keyset.keys[keyid]
+    finally
+        unlock(keyset.lock)
+    end
+end
+
+function resolve_sole_verification_key(source::RemoteJWKSet)
+    lock(source.lock)
+    try
+        ensure_remote_jwks_unlocked!(source, now_seconds(source))
+        length(source.keyset.keys) == 1 || throw(JWTVerificationError(
+            :key_id_missing,
+            "jwt header does not include kid and the key set has $(length(source.keyset.keys)) keys"))
+        keyid = first(keys(source.keyset.keys))
+        return keyid, source.keyset.keys[keyid]
+    finally
+        unlock(source.lock)
+    end
+end
+
+resolve_sole_verification_key(source::OIDCDiscovery) = resolve_sole_verification_key(oidc_jwks_source!(source))

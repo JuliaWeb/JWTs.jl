@@ -101,16 +101,46 @@ mutable struct JWKSet
     url::String
     keys::Dict{String,JWK}
     lock::ReentrantLock
+    # An unknown `kid` triggers a keyset refetch, and `kid` comes straight out of an
+    # attacker-supplied token. Without a cooldown, a stream of tokens bearing random
+    # key ids turns into one outbound JWKS fetch each. `RemoteJWKSet` already guards
+    # this; the same bound applies here.
+    refresh_cooldown::Float64
+    last_unknown_refresh_at::Union{Nothing,Float64}
 
-    function JWKSet(url::String)
-        new(url, Dict{String,JWK}(), ReentrantLock())
+    function JWKSet(url::String; refresh_cooldown::Real=DEFAULT_UNKNOWN_KID_REFRESH_COOLDOWN)
+        refresh_cooldown < 0 && throw(ArgumentError("refresh_cooldown must be non-negative"))
+        new(url, Dict{String,JWK}(), ReentrantLock(), Float64(refresh_cooldown), nothing)
     end
 
-    function JWKSet(keyset::Vector)
+    function JWKSet(keyset::Vector; refresh_cooldown::Real=DEFAULT_UNKNOWN_KID_REFRESH_COOLDOWN)
+        refresh_cooldown < 0 && throw(ArgumentError("refresh_cooldown must be non-negative"))
         keysetdict = Dict{String,JWK}()
         refresh!(keyset, keysetdict)
-        new("", keysetdict, ReentrantLock())
+        new("", keysetdict, ReentrantLock(), Float64(refresh_cooldown), nothing)
     end
+end
+
+"""
+    DEFAULT_UNKNOWN_KID_REFRESH_COOLDOWN
+
+Minimum number of seconds between keyset refetches triggered by a token whose `kid`
+is not already known. Bounds how much outbound traffic an untrusted token stream can
+induce. An explicit `refresh!` is never rate limited.
+"""
+const DEFAULT_UNKNOWN_KID_REFRESH_COOLDOWN = 30.0
+
+# Refresh at most once per cooldown window when an unrecognised `kid` shows up.
+# Returns true when the key is present afterwards.
+function refresh_for_unknown_kid!(keyset::JWKSet, keyid::String; now_value::Float64=time())
+    haskey(keyset.keys, keyid) && return true
+    if keyset.last_unknown_refresh_at !== nothing &&
+            now_value - keyset.last_unknown_refresh_at < keyset.refresh_cooldown
+        return false
+    end
+    keyset.last_unknown_refresh_at = now_value
+    refresh!(keyset)
+    return haskey(keyset.keys, keyid)
 end
 function show(io::IO, jwk::JWKSet)
     print(io, "JWKSet $(length(jwk.keys)) keys")
@@ -320,12 +350,18 @@ show(io::IO, jwt::JWT) = print(io, issigned(jwt) ? join([jwt.header, jwt.payload
 """
     validate!(jwt, keyset)
 
-Validate the JWT using the keys in the keyset.
+Validate the JWT **signature** using the keys in the keyset.
 The JWT must be signed. An exception is thrown otherwise.
 The keyset must contain the key id from the JWT header. A KeyError is thrown otherwise.
 The optional `algorithms` parameter can be used to specify the algorithms to use for validation.
 
-Returns `true` if the JWT is valid, `false` otherwise.
+Returns `true` if the signature is valid, `false` otherwise.
+
+!!! warning "Signature only"
+    This checks the signature and the `alg` header; it does **not** look at any claims,
+    so an expired token validates successfully and [`isvalid`](@ref) reports `true` for it.
+    Use [`verify`](@ref) with a [`Verifier`](@ref) to also enforce `exp`, `nbf`, `iat`,
+    `iss`, and `aud`, or [`with_valid_jwt`](@ref) which rejects expired tokens.
 """
 function validate!(jwt::JWT, keyset::JWKSet; algorithms::Vector{String}=String[])
     keyid = kid(jwt)
@@ -333,7 +369,9 @@ function validate!(jwt::JWT, keyset::JWKSet; algorithms::Vector{String}=String[]
     validate!(jwt, keyset, keyid; algorithms=algorithms)
 end
 function validate!(jwt::JWT, keyset::JWKSet, kid::String; algorithms::Vector{String}=String[])
-    (kid in keys(keyset.keys)) || refresh!(keyset)
+    lock(keyset.lock) do
+        refresh_for_unknown_kid!(keyset, kid)
+    end
     validate!(jwt, keyset.keys[kid]; algorithms=algorithms)
 end
 function validate!(jwt::JWT, key::JWK; algorithms::Vector{String}=String[])
@@ -637,17 +675,31 @@ Arguments:
 
 Keyword arguments:
 - `kid`: The key id to use for validation. If not specified, the `kid` from the JWT header is used.
-- `algorithms`: Ensure validation with one of the listed algorithms. Not enforced by deault.
+- `algorithms`: Ensure validation with one of the listed algorithms. Not enforced by default.
+- `check_expiry`: Reject tokens whose `exp` has passed or whose `nbf` has not yet arrived
+  (default `true`). Pass `false` for the previous signature-only behaviour.
+- `leeway`: Seconds of clock skew tolerated on the time claims (default `0`).
+- `now`: Current time in seconds since the epoch, for testing (default `time()`).
+
+An expired or not-yet-valid token raises [`JWTClaimError`](@ref); a token that fails
+signature validation raises `ArgumentError`. For full claim validation — issuer, audience,
+`iat`/`max_age`, and required claims — use [`verify`](@ref) with a [`Verifier`](@ref).
 """
 function with_valid_jwt(f::Function, jwt::String, keyset::JWKSet;
     kid::Union{Nothing,String}=nothing,
     algorithms::Vector{String}=String[],
+    check_expiry::Bool=true,
+    leeway::Real=0,
+    now::Real=time(),
 )
-    with_valid_jwt(f, JWT(jwt), keyset; kid=kid, algorithms=algorithms)
+    with_valid_jwt(f, JWT(jwt), keyset; kid=kid, algorithms=algorithms, check_expiry=check_expiry, leeway=leeway, now=now)
 end
 function with_valid_jwt(f::Function, jwt::JWT, keyset::JWKSet;
     kid::Union{Nothing,String}=nothing,
     algorithms::Vector{String}=String[],
+    check_expiry::Bool=true,
+    leeway::Real=0,
+    now::Real=time(),
 )
     if isnothing(kid)
         valid = validate!(jwt, keyset; algorithms=algorithms)
@@ -656,6 +708,11 @@ function with_valid_jwt(f::Function, jwt::JWT, keyset::JWKSet;
     end
 
     valid || throw(ArgumentError("invalid jwt"))
+
+    # A signature-valid token can still be expired. Callers of a function named
+    # `with_valid_jwt` reasonably expect "valid" to include the time claims, so
+    # enforce them here rather than handing back a token that expired long ago.
+    check_expiry && check_time_claims(claims(jwt); now=now, leeway=leeway)
 
     return f(jwt)
 end

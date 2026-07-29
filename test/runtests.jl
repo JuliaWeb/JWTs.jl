@@ -286,21 +286,24 @@ function test_with_valid_jwt(keyset_url, algorithms::Vector{String})
     key = first(keys(keyset.keys))
     sign!(jwt, keyset, key)
 
-    with_valid_jwt(jwt, keyset; algorithms=algorithms) do jwt3
+    # The fixture payloads carry `exp` values from 2018, so these calls exercise the
+    # do-block plumbing with expiry checking switched off. Expiry enforcement itself
+    # is covered by the "with_valid_jwt expiry" testset.
+    with_valid_jwt(jwt, keyset; algorithms=algorithms, check_expiry=false) do jwt3
         @test isvalid(jwt3)
         @test claims(jwt3) == d
     end
-    
+
     jwt2 = JWT(; jwt=string(jwt))
-    with_valid_jwt(jwt2, keyset) do jwt3
+    with_valid_jwt(jwt2, keyset; check_expiry=false) do jwt3
         @test isvalid(jwt3)
         @test claims(jwt3) == d
     end
-    with_valid_jwt(string(jwt), keyset; kid=key) do jwt3
+    with_valid_jwt(string(jwt), keyset; kid=key, check_expiry=false) do jwt3
         @test isvalid(jwt3)
         @test claims(jwt3) == d
     end
-    with_valid_jwt(jwt2, keyset; kid=key) do jwt3
+    with_valid_jwt(jwt2, keyset; kid=key, check_expiry=false) do jwt3
         @test isvalid(jwt3)
         @test claims(jwt3) == d
     end
@@ -706,5 +709,152 @@ end
         end
         @test missing_iss_err isa JWTs.JWTClaimError
         @test missing_iss_err.code === :claim_missing
+    end
+end
+
+@testset "hardening: expiry, kid, and refresh bounds" begin
+    keydir = joinpath(@__DIR__, "keys", "rsa")
+    priv = JWTs.JWKRSA("RS256", JWTs.parse_keyfile(joinpath(keydir, "rsakey1.private.pem")))
+    pub = JWTs.JWKRSA("RS256", JWTs.parse_keyfile(joinpath(keydir, "rsakey1.public.pem")))
+    pubset = JWKSet("")
+    pubset.keys["k1"] = pub
+    now_s = round(Int, time())
+
+    signed(payload; header_kid = "k1") = begin
+        jwt = JWT(; payload = payload)
+        sign!(jwt, priv, header_kid)
+        jwt
+    end
+
+    @testset "with_valid_jwt expiry" begin
+        expired = signed(Dict("sub" => "u", "exp" => now_s - 3600))
+        # a signature-valid but expired token must not reach the callback
+        ran = Ref(false)
+        err = try
+            with_valid_jwt(expired, pubset) do _
+                ran[] = true
+            end
+            nothing
+        catch e
+            e
+        end
+        @test !ran[]
+        @test err isa JWTs.JWTClaimError
+        @test err.code === :token_expired
+
+        # opting out restores the old signature-only behaviour
+        ran[] = false
+        with_valid_jwt(expired, pubset; check_expiry = false) do _
+            ran[] = true
+        end
+        @test ran[]
+
+        # leeway can absorb clock skew
+        just_expired = signed(Dict("sub" => "u", "exp" => now_s - 10))
+        @test_throws JWTs.JWTClaimError with_valid_jwt(identity, just_expired, pubset)
+        @test with_valid_jwt(_ -> :ok, just_expired, pubset; leeway = 60) === :ok
+
+        # nbf is enforced too
+        future = signed(Dict("sub" => "u", "nbf" => now_s + 3600))
+        nbf_err = try
+            with_valid_jwt(identity, future, pubset)
+        catch e
+            e
+        end
+        @test nbf_err isa JWTs.JWTClaimError
+        @test nbf_err.code === :token_not_yet_valid
+
+        # a live token still passes, and tokens without time claims are unaffected
+        @test with_valid_jwt(_ -> :ok, signed(Dict("sub" => "u", "exp" => now_s + 3600)), pubset) === :ok
+        @test with_valid_jwt(_ -> :ok, signed(Dict("sub" => "u")), pubset) === :ok
+
+        # validate! remains signature-only by documented design
+        @test validate!(signed(Dict("sub" => "u", "exp" => now_s - 3600)), pubset)
+    end
+
+    @testset "kid is optional when the key set is unambiguous" begin
+        no_kid = JWT(; payload = Dict("sub" => "u"))
+        sign!(no_kid, priv)
+        @test JWTs.kid(no_kid) === nothing
+        verifier = JWTs.Verifier(pubset; algorithms = ["RS256"])
+        verified = JWTs.verify(verifier, no_kid)
+        @test JWTs.claims(verified)["sub"] == "u"
+        # the resolved key id is reported even though the header omitted it
+        @test JWTs.kid(verified) == "k1"
+
+        # ambiguous key sets still demand a kid
+        two = JWKSet("")
+        two.keys["k1"] = pub
+        two.keys["k2"] = JWTs.JWKRSA("RS256", JWTs.parse_keyfile(joinpath(keydir, "rsakey2.public.pem")))
+        ambiguous = JWTs.Verifier(two; algorithms = ["RS256"])
+        err = try
+            JWTs.verify(ambiguous, no_kid)
+        catch e
+            e
+        end
+        @test err isa JWTs.JWTVerificationError
+        @test err.code === :key_id_missing
+
+        # a kid that is present is still honoured, and an unknown one still fails
+        @test JWTs.kid(JWTs.verify(ambiguous, signed(Dict("sub" => "u")))) == "k1"
+        unknown = signed(Dict("sub" => "u"); header_kid = "nope")
+        @test_throws JWTs.JWKSError JWTs.verify(ambiguous, unknown)
+    end
+
+    @testset "unknown kid does not refetch without bound" begin
+        # Write a JWKS to disk and mutate it between calls: if a refetch happened the
+        # keyset picks up the new key, if it was suppressed it does not. That makes the
+        # cooldown observable without depending on timing or a network socket.
+        jwks_path, io = mktemp()
+        close(io)
+        doc(kids) = JSON.json(Dict("keys" => [Dict(
+            "kty" => "oct", "kid" => k, "alg" => "HS256",
+            "k" => JWTs.base64url_encode("supersecretvalue")) for k in kids]))
+        write(jwks_path, doc(["sym"]))
+        keyset = JWKSet("file://" * jwks_path)
+        JWTs.refresh!(keyset)
+        @test haskey(keyset.keys, "sym")
+
+        # publish a second key, then ask for a stream of unknown kids
+        write(jwks_path, doc(["sym", "sym2"]))
+        for i in 1:20
+            JWTs.refresh_for_unknown_kid!(keyset, "bogus-$i")
+        end
+        # exactly one refetch was permitted inside the cooldown window, so the new key
+        # is visible, but the other 19 requests did not each cause their own fetch
+        @test haskey(keyset.keys, "sym2")
+
+        # a third key published now must NOT be picked up while still in cooldown
+        write(jwks_path, doc(["sym", "sym2", "sym3"]))
+        for i in 21:40
+            JWTs.refresh_for_unknown_kid!(keyset, "bogus-$i")
+        end
+        @test !haskey(keyset.keys, "sym3")
+
+        # once the window elapses a refresh is allowed again
+        keyset.last_unknown_refresh_at = time() - 31.0
+        JWTs.refresh_for_unknown_kid!(keyset, "bogus-after-cooldown")
+        @test haskey(keyset.keys, "sym3")
+
+        # a known kid never triggers a refresh at all
+        write(jwks_path, doc(["sym", "sym2", "sym3", "sym4"]))
+        keyset.last_unknown_refresh_at = nothing
+        for _ in 1:10
+            JWTs.refresh_for_unknown_kid!(keyset, "sym")
+        end
+        @test !haskey(keyset.keys, "sym4")
+
+        # a cooldown of zero preserves the previous unbounded-refresh behaviour
+        eager = JWKSet("file://" * jwks_path; refresh_cooldown = 0)
+        JWTs.refresh!(eager)
+        write(jwks_path, doc(["sym", "sym5"]))
+        JWTs.refresh_for_unknown_kid!(eager, "anything")
+        @test haskey(eager.keys, "sym5")
+
+        rm(jwks_path; force = true)
+
+        # the cooldown is configurable, and rejects nonsense
+        @test JWKSet("file:///unused"; refresh_cooldown = 0).refresh_cooldown == 0.0
+        @test_throws ArgumentError JWKSet("file:///unused"; refresh_cooldown = -1)
     end
 end

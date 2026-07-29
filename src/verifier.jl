@@ -40,6 +40,34 @@ function normalize_required_claims(required_claims)
     return out
 end
 
+"""
+    Verifier(keyset; algorithms, issuer=nothing, audience=nothing, subject=nothing,
+             jwtid=nothing, nonce=nothing, leeway=0, max_age=nothing,
+             required_claims=String[], now=time)
+
+Verification policy for [`verify`](@ref). `keyset` is a [`JWKSet`](@ref), a vector of
+keys, a `RemoteJWKSet`, or an `OIDCDiscovery` source.
+
+`algorithms` is mandatory and must be non-empty: accepting whatever algorithm a token
+asks for is how algorithm-substitution attacks start, so the caller states which ones
+are acceptable up front.
+
+`issuer`, `audience`, `subject`, `jwtid`, and `nonce` are checked only when supplied.
+`leeway` (seconds) absorbs clock skew on the time claims, and `max_age` bounds how old
+`iat` may be.
+
+!!! note "Time claims are enforced only when present"
+    `exp` and `nbf` are validated when the token carries them, but a token with no `exp`
+    at all is *not* rejected — it simply never expires. If your issuer is supposed to
+    always set an expiry, say so explicitly:
+
+    ```julia
+    Verifier(keyset; algorithms=["RS256"], required_claims=["exp"])
+    ```
+
+Convenience constructors also accept an OIDC issuer URL (`Verifier(issuer_url; ...)`) or
+a `jwks_uri` keyword, both of which fetch and cache the key set for you.
+"""
 function Verifier(
     keyset::VerifierKeySource;
     algorithms=nothing,
@@ -203,17 +231,32 @@ function require_claims!(claimset, required_claims)
     return nothing
 end
 
-function validate_time_claims!(claimset, verifier::Verifier, now_value::Real)
-    now_s = Float64(now_value)
-    leeway = verifier.leeway
+"""
+    check_time_claims(claimset; now=time(), leeway=0)
+
+Enforce the `exp` and `nbf` claims of a decoded claim set, throwing [`JWTClaimError`](@ref)
+when the token is expired or not yet valid. Claims that are absent are not enforced.
+
+This is the shared core used by both [`verify`](@ref) and [`with_valid_jwt`](@ref).
+"""
+function check_time_claims(claimset; now::Real=time(), leeway::Real=0)
+    now_s = Float64(now)
+    leeway_s = Float64(leeway)
     if haskey(claimset, "exp")
         exp = claim_number(claimset, "exp")
-        now_s <= exp + leeway || throw(JWTClaimError(:token_expired, "jwt expired"))
+        now_s <= exp + leeway_s || throw(JWTClaimError(:token_expired, "jwt expired"))
     end
     if haskey(claimset, "nbf")
         nbf = claim_number(claimset, "nbf")
-        now_s + leeway >= nbf || throw(JWTClaimError(:token_not_yet_valid, "jwt not yet valid"))
+        now_s + leeway_s >= nbf || throw(JWTClaimError(:token_not_yet_valid, "jwt not yet valid"))
     end
+    return nothing
+end
+
+function validate_time_claims!(claimset, verifier::Verifier, now_value::Real)
+    now_s = Float64(now_value)
+    leeway = verifier.leeway
+    check_time_claims(claimset; now=now_s, leeway=leeway)
     if haskey(claimset, "iat")
         iat = claim_number(claimset, "iat")
         now_s + leeway >= iat || throw(JWTClaimError(:token_issued_in_future, "jwt issued in the future"))
@@ -247,6 +290,25 @@ function validate_claims!(claimset, verifier::Verifier, now_value::Real)
     return nothing
 end
 
+"""
+    verify(verifier::Verifier, jwt) -> VerifiedJWT
+
+Fully verify a JWT: decode the header, check `alg` against the verifier's allowlist,
+resolve the signing key, verify the signature, then validate the claims. `jwt` may be a
+compact token `String` or a [`JWT`](@ref).
+
+Returns a [`VerifiedJWT`](@ref) on success. On failure it throws a [`JWTError`](@ref) —
+[`JWTVerificationError`](@ref) for header/signature problems, [`JWTClaimError`](@ref) for
+claim problems — each carrying a `code` symbol such as `:algorithm_disallowed`,
+`:signature_invalid`, `:token_expired`, or `:claim_mismatch`.
+
+Unlike [`validate!`](@ref), which only checks the signature, this enforces the claim
+policy configured on the `Verifier`.
+
+The `kid` header is optional: when the token omits it and the key set holds exactly one
+key, that key is used (RFC 7515 §4.1.4). An ambiguous key set requires the token to say
+which key it used.
+"""
 verify(verifier::Verifier, jwt::String) = verify(verifier, JWT(jwt))
 
 function verify(verifier::Verifier, jwt::JWT)
@@ -261,8 +323,11 @@ function verify(verifier::Verifier, jwt::JWT)
     header_alg === nothing && throw(JWTVerificationError(:algorithm_missing, "jwt header does not include alg"))
     header_alg in verifier.algorithms || throw(JWTVerificationError(:algorithm_disallowed, "jwt algorithm is not allowed"))
     header_kid = jwt_string_claim(header, "kid")
-    header_kid === nothing && throw(JWTVerificationError(:key_id_missing, "jwt header does not include kid"))
-    key = resolve_verification_key(verifier.keyset, header_kid)
+    resolved_kid, key = if header_kid === nothing
+        resolve_sole_verification_key(verifier.keyset)
+    else
+        header_kid, resolve_verification_key(verifier.keyset, header_kid)
+    end
     valid = validate!(jwt, key; algorithms=verifier.algorithms)
     valid || throw(JWTVerificationError(:signature_invalid, "invalid jwt signature"))
     claimset = try
@@ -272,5 +337,5 @@ function verify(verifier::Verifier, jwt::JWT)
         throw(JWTClaimError(:malformed_payload, "jwt payload is not valid base64url-encoded JSON"))
     end
     validate_claims!(claimset, verifier, verifier.now())
-    return VerifiedJWT(jwt, header, claimset, header_kid, header_alg, key)
+    return VerifiedJWT(jwt, header, claimset, resolved_kid, header_alg, key)
 end
