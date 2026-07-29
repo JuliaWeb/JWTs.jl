@@ -369,10 +369,11 @@ function validate!(jwt::JWT, keyset::JWKSet; algorithms::Vector{String}=String[]
     validate!(jwt, keyset, keyid; algorithms=algorithms)
 end
 function validate!(jwt::JWT, keyset::JWKSet, kid::String; algorithms::Vector{String}=String[])
-    lock(keyset.lock) do
+    key = lock(keyset.lock) do
         refresh_for_unknown_kid!(keyset, kid)
+        return keyset.keys[kid]
     end
-    validate!(jwt, keyset.keys[kid]; algorithms=algorithms)
+    validate!(jwt, key; algorithms=algorithms)
 end
 function validate!(jwt::JWT, key::JWK; algorithms::Vector{String}=String[])
     issigned(jwt) || throw(ArgumentError("jwt is not signed"))
@@ -712,7 +713,14 @@ function with_valid_jwt(f::Function, jwt::JWT, keyset::JWKSet;
     # A signature-valid token can still be expired. Callers of a function named
     # `with_valid_jwt` reasonably expect "valid" to include the time claims, so
     # enforce them here rather than handing back a token that expired long ago.
-    check_expiry && check_time_claims(claims(jwt); now=now, leeway=leeway)
+    if check_expiry
+        claimset = try
+            decode_jwt_json_object(jwt.payload)
+        catch err
+            throw(JWTClaimError(:malformed_payload, "jwt payload must be a valid JSON object"))
+        end
+        check_time_claims(claimset; now=now, leeway=leeway)
+    end
 
     return f(jwt)
 end

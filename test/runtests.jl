@@ -753,6 +753,7 @@ end
         just_expired = signed(Dict("sub" => "u", "exp" => now_s - 10))
         @test_throws JWTs.JWTClaimError with_valid_jwt(identity, just_expired, pubset)
         @test with_valid_jwt(_ -> :ok, just_expired, pubset; leeway = 60) === :ok
+        @test_throws ArgumentError with_valid_jwt(identity, just_expired, pubset; leeway = -1)
 
         # nbf is enforced too
         future = signed(Dict("sub" => "u", "nbf" => now_s + 3600))
@@ -767,6 +768,16 @@ end
         # a live token still passes, and tokens without time claims are unaffected
         @test with_valid_jwt(_ -> :ok, signed(Dict("sub" => "u", "exp" => now_s + 3600)), pubset) === :ok
         @test with_valid_jwt(_ -> :ok, signed(Dict("sub" => "u")), pubset) === :ok
+
+        malformed_payload = JWT(; payload = Any["not", "an", "object"])
+        sign!(malformed_payload, priv, "k1")
+        malformed_err = try
+            with_valid_jwt(identity, malformed_payload, pubset)
+        catch e
+            e
+        end
+        @test malformed_err isa JWTs.JWTClaimError
+        @test malformed_err.code === :malformed_payload
 
         # validate! remains signature-only by documented design
         @test validate!(signed(Dict("sub" => "u", "exp" => now_s - 3600)), pubset)

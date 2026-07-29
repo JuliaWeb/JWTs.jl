@@ -242,6 +242,7 @@ This is the shared core used by both [`verify`](@ref) and [`with_valid_jwt`](@re
 function check_time_claims(claimset; now::Real=time(), leeway::Real=0)
     now_s = Float64(now)
     leeway_s = Float64(leeway)
+    leeway_s < 0 && throw(ArgumentError("leeway must be non-negative"))
     if haskey(claimset, "exp")
         exp = claim_number(claimset, "exp")
         now_s <= exp + leeway_s || throw(JWTClaimError(:token_expired, "jwt expired"))
