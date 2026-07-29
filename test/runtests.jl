@@ -801,6 +801,49 @@ end
         @test_throws JWTs.JWKSError JWTs.verify(ambiguous, unknown)
     end
 
+    @testset "kid optional for remote and OIDC key sources" begin
+        # the same single-key rule must hold for RemoteJWKSet and OIDCDiscovery,
+        # not just an in-memory JWKSet
+        jwk_doc = JSON.parse(read(joinpath(keydir, "jwkkey.json"), String))
+        sole = Dict("keys" => [jwk_doc["keys"][1]])
+        sole_kid = sole["keys"][1]["kid"]
+        sole_priv = JWTs.JWKRSA("RS256", JWTs.parse_keyfile(joinpath(keydir, "rsakey1.private.pem")))
+
+        no_kid = JWT(; payload = Dict("sub" => "remote"))
+        sign!(no_kid, sole_priv)
+        @test JWTs.kid(no_kid) === nothing
+
+        remote = JWTs.Verifier(; jwks_uri = "https://issuer.example/keys",
+            algorithms = ["RS256"], fetcher = (_ -> sole), now = () -> 1000.0)
+        verified = JWTs.verify(remote, no_kid)
+        @test JWTs.kid(verified) == sole_kid
+
+        # Verifier(issuer_url; ...) expects a matching `iss` claim, so sign one that has it
+        oidc_issuer = "https://issuer.example/oauth2/default"
+        oidc_token = JWT(; payload = Dict("sub" => "remote", "iss" => oidc_issuer))
+        sign!(oidc_token, sole_priv)
+        oidc = JWTs.Verifier(oidc_issuer; algorithms = ["RS256"], now = () -> 1000.0,
+            fetcher = function (url)
+                endswith(url, "/keys") && return sole
+                return Dict("issuer" => oidc_issuer, "jwks_uri" => "https://issuer.example/keys")
+            end)
+        @test JWTs.kid(JWTs.verify(oidc, oidc_token)) == sole_kid
+
+        # more than one key remains ambiguous for a remote source too
+        both = Dict("keys" => jwk_doc["keys"])
+        if length(both["keys"]) > 1
+            ambiguous = JWTs.Verifier(; jwks_uri = "https://issuer.example/keys",
+                algorithms = ["RS256"], fetcher = (_ -> both), now = () -> 1000.0)
+            err = try
+                JWTs.verify(ambiguous, no_kid)
+            catch e
+                e
+            end
+            @test err isa JWTs.JWTVerificationError
+            @test err.code === :key_id_missing
+        end
+    end
+
     @testset "unknown kid does not refetch without bound" begin
         # Write a JWKS to disk and mutate it between calls: if a refetch happened the
         # keyset picks up the new key, if it was suppressed it does not. That makes the
