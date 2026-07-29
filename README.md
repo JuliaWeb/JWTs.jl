@@ -16,33 +16,50 @@ Pkg.add("JWTs")
 
 JWTs.jl supports Julia 1.6 and newer.
 
-## ⚠️ Upgrading to 1.1
+## ⚠️ Upgrading to 2.0
 
-Two defaults changed, both toward rejecting tokens that were previously accepted.
+The default behavior of `with_valid_jwt` changed. This is why the release has a new
+major version.
 
 **`with_valid_jwt` now rejects expired tokens.** It previously validated only the
 signature, so a token whose `exp` passed an hour ago still reached your callback. It now
 also enforces `exp` and `nbf`, raising `JWTs.JWTClaimError` instead. If you were relying on
-signature-only behaviour, ask for it explicitly:
+the previous `exp`/`nbf` behavior, ask for it explicitly:
 
 ```julia
 JWTs.with_valid_jwt(token, keyset; check_expiry=false) do jwt
-    # previous behaviour
+    # skips exp and nbf checks; signature and JOSE header checks still run
 end
 ```
 
 `JWTs.validate!` is unchanged — it remains signature-only by design, and its docstring now
 says so plainly.
 
-**An unrecognised `kid` no longer refetches the key set on every call.** A token's `kid` is
-attacker-controlled, so a stream of tokens bearing random key ids previously produced one
-outbound JWKS fetch each. `JWKSet` now applies the same refresh cooldown `RemoteJWKSet`
-already used (30s default, `JWKSet(url; refresh_cooldown=…)`, `0` restores the old
-behaviour). An explicit `JWTs.refresh!` is never rate limited.
+**An unrecognised `kid` no longer refetches the key set on every call.** A token's
+`kid` is attacker-controlled. A stream of tokens with random key ids previously
+produced one outbound JWKS fetch each. Each key-source instance now has one key-miss
+refresh budget (30s default, `JWKSet(url; refresh_cooldown=…)`, `0` restores the old
+behavior). The new missing-`kid` path uses the same budget. An explicit
+`JWTs.refresh!` is never rate limited.
 
-**Also in 1.1:** `verify` now accepts tokens whose header omits `kid` when the key set holds
-exactly one key, per RFC 7515 §4.1.4 — single-key issuers commonly omit it, and those tokens
-were previously rejected outright.
+**Also in 2.0:** `verify` accepts tokens whose header omits `kid` when the key set holds
+exactly one key, per RFC 7515 §4.1.4. Single-key issuers commonly omit it. A failed
+signature check can cause one cooldown-bounded refresh and one retry, so a single-key
+issuer can rotate its key before the cache TTL expires.
+
+`verify` now rejects unsupported critical JOSE header parameters and unencoded
+(`"b64": false`) payloads. A present `kid` must be a string.
+
+OIDC discovery now requires HTTPS for both the issuer and the discovered `jwks_uri`.
+The discovered issuer must match the configured issuer exactly, including any trailing
+slash. Discovery metadata and its JWKS are installed together only after both fetches
+succeed. Imported JWKs now retain and enforce their `use` and `key_ops` restrictions for
+signing and verification.
+
+Remote and OIDC verifier constructors now use separate clocks. `now` controls JWT
+NumericDate claim checks. The new `cache_now` keyword controls cache TTLs and refresh
+cooldowns, and uses a monotonic clock by default. Tests that inject one clock for both
+purposes must now pass it as both `now` and `cache_now`.
 
 ## Supported Algorithms
 
@@ -146,7 +163,8 @@ Supported verifier options include:
 - `leeway`: clock skew allowance in seconds
 - `max_age`: maximum token age from `iat`
 - `required_claims`: claims that must be present
-- `now`: injectable clock, useful for deterministic tests
+- `now`: epoch-seconds clock for claim validation
+- `cache_now`: monotonic cache TTL and cooldown clock for remote and OIDC verifiers
 
 `aud` may be either a string or an array of strings, matching RFC 7519.
 
@@ -154,7 +172,9 @@ Supported verifier options include:
 
 ## Remote JWKS
 
-For a provider JWKS endpoint, construct a verifier with `jwks_uri`. Keys are fetched lazily, cached for `jwks_ttl` seconds, refreshed when stale, and refreshed early when a token contains an unknown `kid`.
+For a provider JWKS endpoint, construct a verifier with `jwks_uri`. Keys are fetched
+lazily, cached for `jwks_ttl` seconds, refreshed when stale, and refreshed early when a
+token cannot be verified with the cached keys.
 
 ```julia
 verifier = JWTs.Verifier(;
@@ -169,7 +189,12 @@ verifier = JWTs.Verifier(;
 verified = JWTs.verify(verifier, token_string)
 ```
 
-`refresh_cooldown` prevents repeated failed refresh attempts from turning every bad token into a network request. The last good key set is retained when a later refresh fails.
+`refresh_cooldown` prevents repeated key misses from turning every bad token into a
+network request. The cache uses a monotonic clock by default. A refresh does not hold
+the cached-key lock during network I/O, so other tasks can continue to use the last
+good key set. The last good key set is retained when a later refresh fails. Remote
+verification also ignores JWKs whose `use` or `key_ops` fields do not permit signature
+verification.
 
 Tests can inject a deterministic fetcher:
 
@@ -178,11 +203,22 @@ fetcher = url -> read("fixtures/jwks.json", String)
 verifier = JWTs.Verifier(; jwks_uri="https://issuer.example/keys", algorithms=["RS256"], fetcher=fetcher)
 ```
 
-The default fetcher uses Downloads.jl. Pass `downloader=Downloads.Downloader()` when you want to reuse a configured Downloads downloader, or pass `fetcher=url -> ...` when tests or applications need full control over network access. The same keywords are available on `JWTs.refresh!(keyset)` for direct `JWKSet` refreshes.
+The default fetcher uses Downloads.jl. Pass `downloader=Downloads.Downloader()` when
+you want to reuse a configured Downloads downloader, or pass `fetcher=url -> ...` when
+tests or applications need full control over network access. Direct `JWKSet`
+constructors retain these settings for later token-driven refreshes. The same keywords
+are available on `JWTs.refresh!(keyset)`. Overrides passed to `refresh!` also become the
+retained settings for later automatic refreshes.
 
 ## OpenID Connect Discovery
 
-Pass an issuer URL as the first argument to use OpenID Connect discovery. JWTs.jl fetches `/.well-known/openid-configuration`, validates a matching discovery `issuer` when present, reads `jwks_uri`, and then uses the same cached remote JWKS behavior.
+Pass an issuer URL as the first argument to use OpenID Connect discovery. JWTs.jl
+requires an HTTPS issuer, fetches `/.well-known/openid-configuration`, requires the
+discovery `issuer` to match the configured issuer exactly, and requires an HTTPS
+`jwks_uri`. Issuer identifiers are not normalized, so a trailing slash remains
+significant. Discovery metadata and its selected key set are installed together only
+after both fetches pass validation. A failed replacement therefore retains the last
+complete key source.
 
 ```julia
 verifier = JWTs.Verifier(
@@ -215,7 +251,11 @@ JWTs.with_valid_jwt(token_string, keyset; algorithms=["RS256"], leeway=60) do jw
 end
 ```
 
-Pass `check_expiry=false` for the previous signature-only behaviour. Neither helper validates `iss`, `aud`, `iat`/`max_age`, or required claims — use `JWTs.Verifier` for application authentication and authorization boundaries. `algorithms` is optional on these helpers for backwards compatibility, but passing an explicit allowlist is strongly recommended.
+Pass `check_expiry=false` to opt out of the new time-claim checks. Protected JOSE
+header checks still apply. Neither helper validates `iss`, `aud`, `iat`/`max_age`, or required
+claims — use `JWTs.Verifier` for application authentication and authorization
+boundaries. `algorithms` is optional on these helpers for backwards compatibility, but
+passing an explicit allowlist is strongly recommended.
 
 ## Errors
 
