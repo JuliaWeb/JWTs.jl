@@ -19,6 +19,12 @@ function trim_signature_payload()
     return payload
 end
 
+struct TrimSignatureClaims
+    iss::String
+    sub::String
+    aud::String
+end
+
 function trim_signature_token(jwt::JWTs.JWT)::String
     return join((jwt.header::String, jwt.payload, jwt.signature::String), ".")
 end
@@ -31,7 +37,8 @@ function run_jwt_trim_signature()::Nothing
 
     parsed = JWTs.JWT(token)
     JWTs.issigned(parsed) || error("expected signed JWT")
-    # JSON.jl parsing is intentionally covered by ordinary tests; it is not trim-clean today.
+    claims = JWTs.claims(parsed, TrimSignatureClaims)
+    claims.iss == "https://issuer.example" || error("issuer claim mismatch")
     data = (parsed.header::String) * "." * parsed.payload
     signature = JWTs.base64url_decode(parsed.signature::String)
     JWTs.verifybytes(key, data, signature) || error("signature validation failed")

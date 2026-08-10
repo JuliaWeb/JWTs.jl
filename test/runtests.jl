@@ -77,6 +77,22 @@ const test_payload_data = [
     }""")
 ]
 
+struct TypedTestClaims
+    sub::String
+    exp::Int64
+end
+
+@testset "typed claims" begin
+    jwt = JWT(; payload=Dict("sub" => "user-42", "exp" => 2_000))
+    if applicable(JSON.parse, "", TypedTestClaims)
+        typed = claims(jwt, TypedTestClaims)
+        @test typed.sub == "user-42"
+        @test typed.exp == 2_000
+    else
+        @test_throws ArgumentError claims(jwt, TypedTestClaims)
+    end
+end
+
 function print_header(msg)
     println("")
     println("-"^60)
