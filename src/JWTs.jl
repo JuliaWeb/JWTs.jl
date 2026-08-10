@@ -220,10 +220,26 @@ function decodepart(encoded::String)
     end
 end
 
+function decodepart(encoded::String, ::Type{T})::T where {T}
+    json = String(base64url_decode(encoded))
+    applicable(JSON.parse, json, T) ||
+        throw(ArgumentError("decoding JWT parts as concrete types requires JSON.jl 1"))
+    try
+        return JSON.parse(json, T)
+    catch
+        throw(ArgumentError("JWT part could not be decoded as $T"))
+    end
+end
+
 function decode_jwt_json_object(encoded::String)::JWTJSONDict
     value = decodepart(encoded)
     value isa JWTJSONDict || throw(ArgumentError("JWT part must be a JSON object"))
     return value
+end
+
+Base.@kwdef struct JWTHeaderClaims
+    alg::Union{Nothing,String} = nothing
+    kid::Union{Nothing,String} = nothing
 end
 
 function jwt_string_claim(claims::AbstractDict, claim::String)::Union{Nothing,String}
@@ -233,7 +249,13 @@ function jwt_string_claim(claims::AbstractDict, claim::String)::Union{Nothing,St
 end
 
 function jwt_header_string_claim(encoded::String, claim::String)::Union{Nothing,String}
-    return jwt_string_claim(decode_jwt_json_object(encoded), claim)
+    if !applicable(JSON.parse, "", JWTHeaderClaims)
+        return jwt_string_claim(decode_jwt_json_object(encoded), claim)
+    end
+    header = decodepart(encoded, JWTHeaderClaims)
+    claim == "alg" && return header.alg
+    claim == "kid" && return header.kid
+    return nothing
 end
 
 """
@@ -242,6 +264,17 @@ end
 Get the claims from the JWT payload.
 """
 claims(jwt::JWT) = decodepart(jwt.payload)
+
+"""
+    claims(jwt::JWT, ::Type{T}) -> T
+
+Decode the JWT payload as the concrete type `T`.
+
+This form validates the expected claim shape while parsing. It also keeps the
+result type visible to static compilation. It requires JSON.jl 1. Use the
+one-argument form when the claim schema is not known in advance.
+"""
+claims(jwt::JWT, ::Type{T}) where {T} = decodepart(jwt.payload, T)
 
 """
     issigned(jwt::JWT)

@@ -177,6 +177,8 @@ function _run_trim_case(package_project_path::String, juliac_project_path::Strin
                 fallback = _count_trim_verify_messages(output)
                 if exit_code == 0 && fallback == (0, 0)
                     fallback
+                elseif fallback != (0, 0)
+                    fallback
                 else
                     error("failed to parse trim verifier summary:\n$output")
                 end
