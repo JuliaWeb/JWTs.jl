@@ -1,7 +1,10 @@
 const VerifierKeySource = Union{JWKSet,RemoteJWKSet,OIDCDiscovery}
 
-struct Verifier
-    keyset::VerifierKeySource
+# Parametric on the key source and clock so a verifier built over a static
+# keyset never makes the remote-JWKS refresh machinery statically reachable
+# (and `now()` stays a direct call) — required for juliac --trim consumers.
+struct Verifier{S<:VerifierKeySource, F}
+    keyset::S
     algorithms::Vector{String}
     issuer::Union{Nothing,String}
     audiences::Union{Nothing,Vector{String}}
@@ -11,7 +14,7 @@ struct Verifier
     leeway::Float64
     max_age::Union{Nothing,Float64}
     required_claims::Vector{String}
-    now::Function
+    now::F
 end
 
 struct VerifiedJWT
