@@ -508,27 +508,33 @@ function refresh!(keyseturl::String, keysetdict::Dict{String,JWK}; default_algs 
     refresh!(keys, keysetdict; default_algs=default_algs, allow_symmetric=allow_symmetric)
 end
 
-function default_jwk_alg(key, default_algs)
-    haskey(key, "alg") && return key["alg"]
-    kty = key["kty"]
+# RFC 7517 JWK members are strings; the `::String` asserts turn each dict
+# lookup from an `Any` that dynamically dispatches every downstream call
+# (JWK construction, base64 decoding, keyset insertion) into a concrete value
+# with statically resolvable calls — required for `juliac --trim` — while a
+# malformed member lands in `refresh!`'s existing per-key skip handling.
+function default_jwk_alg(key::AbstractDict, default_algs::Dict{String,String})::String
+    haskey(key, "alg") && return key["alg"]::String
+    kty = key["kty"]::String
     if kty in ("EC", "OKP")
-        return alg_for_curve(key["crv"])
+        return alg_for_curve(key["crv"]::String)
     else
         return get(default_algs, kty, "none")
     end
 end
 
 function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), allow_symmetric::Bool=true)
+    default_algs_str = convert(Dict{String,String}, default_algs)
     for key in keys
-        kid = key["kid"]
-        kty = key["kty"]
-        alg = default_jwk_alg(key, default_algs)
+        kid = key["kid"]::String
+        kty = key["kty"]::String
+        alg = default_jwk_alg(key, default_algs_str)
 
         # ref: https://tools.ietf.org/html/rfc7518
         try
             if kty == "RSA"
-                n = base64url_decode(key["n"])
-                e = base64url_decode(key["e"])
+                n = base64url_decode(key["n"]::String)
+                e = base64url_decode(key["e"]::String)
                 if alg in RSA_ALGORITHMS
                     keysetdict[kid] = JWKRSA(alg, rsa_public_key(n, e))
                 else
@@ -540,7 +546,7 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                     @warn("symmetric keys are not accepted from this key source, skipping key $kid")
                     continue
                 end
-                k = base64url_decode(key["k"])
+                k = base64url_decode(key["k"]::String)
                 if alg in HMAC_ALGORITHMS
                     keysetdict[kid] = JWKSymmetric(alg, k)
                 else
@@ -548,9 +554,9 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                     continue
                 end
             elseif kty == "EC"
-                crv = key["crv"]
-                x = base64url_decode(key["x"])
-                y = base64url_decode(key["y"])
+                crv = key["crv"]::String
+                x = base64url_decode(key["x"]::String)
+                y = base64url_decode(key["y"]::String)
                 if alg in EC_ALGORITHMS
                     keysetdict[kid] = JWKEC(alg, ec_public_key(crv, x, y), crv)
                 else
@@ -558,8 +564,8 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                     continue
                 end
             elseif kty == "OKP"
-                crv = key["crv"]
-                x = base64url_decode(key["x"])
+                crv = key["crv"]::String
+                x = base64url_decode(key["x"]::String)
                 if alg in OKP_ALGORITHMS
                     keysetdict[kid] = JWKOKP(alg, okp_public_key(crv, x), crv)
                 else
