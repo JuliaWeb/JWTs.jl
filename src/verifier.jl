@@ -3,7 +3,12 @@ const VerifierKeySource = Union{JWKSet,RemoteJWKSet,OIDCDiscovery}
 # Parametric on the key source and clock so a verifier built over a static
 # keyset never makes the remote-JWKS refresh machinery statically reachable
 # (and `now()` stays a direct call) — required for juliac --trim consumers.
-struct Verifier{S<:VerifierKeySource, F}
+# `C` is the type the payload is decoded into: `Dict{String,Any}` by default
+# (an open claim set, read dynamically), or an application-declared claims
+# struct passed as `Verifier(...; claims=MyClaims)`, decoded with
+# `JSON.parse(payload, MyClaims)` so every claim read is a typed field access
+# — the shape a statically compiled (`juliac --trim`) verifier needs.
+struct Verifier{S<:VerifierKeySource, F, C}
     keyset::S
     algorithms::Vector{String}
     issuer::Union{Nothing,String}
@@ -15,12 +20,20 @@ struct Verifier{S<:VerifierKeySource, F}
     max_age::Union{Nothing,Float64}
     required_claims::Vector{String}
     now::F
+    claims::Type{C}
 end
 
-struct VerifiedJWT
+"""
+    JWTs.claimstype(verifier::Verifier) -> Type
+
+The type a verifier decodes token payloads into (`Dict{String,Any}` by default).
+"""
+claimstype(::Verifier{S,F,C}) where {S,F,C} = C
+
+struct VerifiedJWT{C}
     token::JWT
-    header::JWTJSONDict
-    claims::JWTJSONDict
+    header::JWTHeaderClaims
+    claims::C
     kid::String
     alg::String
     key::JWK
@@ -55,6 +68,7 @@ function Verifier(
     max_age::Union{Nothing,Real}=nothing,
     required_claims=String[],
     now=time,
+    claims::Type=Dict{String,Any},
 )
     algorithms === nothing && throw(ArgumentError("Verifier requires an explicit algorithms allowlist"))
     algs = String[String(alg) for alg in algorithms]
@@ -76,10 +90,16 @@ function Verifier(
         max_age === nothing ? nothing : Float64(max_age),
         normalize_required_claims(required_claims),
         normalize_now_function(now),
+        claims,
     )
 end
 
-Verifier(keys::Vector; kwargs...) = Verifier(JWKSet(keys); kwargs...)
+
+# Explicit forwarding (not `kwargs...` splatting) so the call resolves to
+# the keyset constructor alone: with a splat, inference unions this over
+# every keyword `Verifier` method, and the result type is no longer concrete.
+Verifier(keys::Vector; algorithms=nothing, issuer=nothing, audience=nothing, subject=nothing, jwtid=nothing, nonce=nothing, leeway::Real=0, max_age=nothing, required_claims=String[], now=time, claims::Type=Dict{String,Any}) =
+    Verifier(JWKSet(keys); algorithms, issuer, audience, subject, jwtid, nonce, leeway, max_age, required_claims, now, claims)
 
 function Verifier(
     issuer_url::AbstractString;
@@ -171,22 +191,22 @@ function Verifier(;
 end
 
 function claim_number(claimset, name::String)
-    value = get(claimset, name, nothing)
+    value = claimvalue(claimset, name)
     value isa Bool && throw(JWTClaimError(:claim_type, "jwt claim $name must be numeric"))
     value isa Real && return Float64(value)
     throw(JWTClaimError(:claim_type, "jwt claim $name must be numeric"))
 end
 
 function claim_string(claimset, name::String)
-    haskey(claimset, name) || throw(JWTClaimError(:claim_missing, "jwt missing required claim $name"))
-    value = claimset[name]
+    hasclaim(claimset, name) || throw(JWTClaimError(:claim_missing, "jwt missing required claim $name"))
+    value = claimvalue(claimset, name)
     value isa AbstractString && return String(value)
     throw(JWTClaimError(:claim_type, "jwt claim $name must be a string"))
 end
 
 function claim_audiences(claimset)
-    haskey(claimset, "aud") || throw(JWTClaimError(:claim_missing, "jwt missing required claim aud"))
-    value = claimset["aud"]
+    value = claimvalue(claimset, "aud")
+    value === nothing && throw(JWTClaimError(:claim_missing, "jwt missing required claim aud"))
     # JSON claims are concrete String / Vector{Any}; narrowing to those (not
     # AbstractString / AbstractVector) keeps the loop statically dispatched.
     value isa String && return String[value]
@@ -202,9 +222,25 @@ function claim_audiences(claimset)
     throw(JWTClaimError(:claim_type, "jwt claim aud must be a string or array of strings"))
 end
 
+# Read one claim from a decoded claim set: a dict lookup, or the field of an
+# application-declared claims struct (`nothing` when absent / no such field).
+# Everything below reads claims only through this seam and `hasclaim`, so a
+# typed claim set flows through validation with concrete field types.
+# Decode a payload into the verifier's claims type.
+decode_claims(encoded::String, ::Type{Dict{String,Any}}) = decode_jwt_json_object(encoded)
+decode_claims(encoded::String, ::Type{C}) where {C} = decodepart(encoded, C)
+
+claimvalue(claims::AbstractDict, name::String) = get(claims, name, nothing)
+function claimvalue(claims::T, name::String) where {T}
+    sym = Symbol(name)
+    return hasfield(T, sym) ? getfield(claims, sym) : nothing
+end
+hasclaim(claims::AbstractDict, name::String) = haskey(claims, name)
+hasclaim(claims::T, name::String) where {T} = (sym = Symbol(name); hasfield(T, sym) && getfield(claims, sym) !== nothing)
+
 function require_claims!(claimset, required_claims)
     for claim in required_claims
-        haskey(claimset, claim) || throw(JWTClaimError(:claim_missing, "jwt missing required claim $claim"))
+        hasclaim(claimset, claim) || throw(JWTClaimError(:claim_missing, "jwt missing required claim $claim"))
     end
     return nothing
 end
@@ -212,15 +248,15 @@ end
 function validate_time_claims!(claimset, verifier::Verifier, now_value::Real)
     now_s = Float64(now_value)
     leeway = verifier.leeway
-    if haskey(claimset, "exp")
+    if hasclaim(claimset, "exp")
         exp = claim_number(claimset, "exp")
         now_s <= exp + leeway || throw(JWTClaimError(:token_expired, "jwt expired"))
     end
-    if haskey(claimset, "nbf")
+    if hasclaim(claimset, "nbf")
         nbf = claim_number(claimset, "nbf")
         now_s + leeway >= nbf || throw(JWTClaimError(:token_not_yet_valid, "jwt not yet valid"))
     end
-    if haskey(claimset, "iat")
+    if hasclaim(claimset, "iat")
         iat = claim_number(claimset, "iat")
         now_s + leeway >= iat || throw(JWTClaimError(:token_issued_in_future, "jwt issued in the future"))
         if verifier.max_age !== nothing
@@ -239,9 +275,11 @@ function validate_expected_claims!(claimset, verifier::Verifier)
     verifier.subject === nothing || claim_string(claimset, "sub") == verifier.subject || throw(JWTClaimError(:claim_mismatch, "jwt subject mismatch"))
     verifier.jwtid === nothing || claim_string(claimset, "jti") == verifier.jwtid || throw(JWTClaimError(:claim_mismatch, "jwt id mismatch"))
     verifier.nonce === nothing || claim_string(claimset, "nonce") == verifier.nonce || throw(JWTClaimError(:claim_mismatch, "jwt nonce mismatch"))
-    if verifier.audiences !== nothing
+    expected_audiences = verifier.audiences
+    if expected_audiences !== nothing
         actual = claim_audiences(claimset)
-        any(aud -> aud in verifier.audiences, actual) || throw(JWTClaimError(:claim_mismatch, "jwt audience mismatch"))
+        # capture the narrowed local, not the Union{Nothing,...} field
+        any(aud -> aud in expected_audiences, actual) || throw(JWTClaimError(:claim_mismatch, "jwt audience mismatch"))
     end
     return nothing
 end
@@ -258,21 +296,21 @@ verify(verifier::Verifier, jwt::String) = verify(verifier, JWT(jwt))
 function verify(verifier::Verifier, jwt::JWT)
     issigned(jwt) || throw(JWTVerificationError(:token_unsigned, "jwt is not signed"))
     header = try
-        decode_jwt_json_object(jwt.header)
+        decode_jwt_header_claims(jwt.header)
     catch err
         err isa JWTError && rethrow()
         throw(JWTVerificationError(:malformed_header, "jwt header is not valid base64url-encoded JSON"))
     end
-    header_alg = jwt_string_claim(header, "alg")
+    header_alg = header.alg
     header_alg === nothing && throw(JWTVerificationError(:algorithm_missing, "jwt header does not include alg"))
     header_alg in verifier.algorithms || throw(JWTVerificationError(:algorithm_disallowed, "jwt algorithm is not allowed"))
-    header_kid = jwt_string_claim(header, "kid")
+    header_kid = header.kid
     header_kid === nothing && throw(JWTVerificationError(:key_id_missing, "jwt header does not include kid"))
     key = resolve_verification_key(verifier.keyset, header_kid)
     valid = validate!(jwt, key; algorithms=verifier.algorithms)
     valid || throw(JWTVerificationError(:signature_invalid, "invalid jwt signature"))
     claimset = try
-        decode_jwt_json_object(jwt.payload)
+        decode_claims(jwt.payload, claimstype(verifier))
     catch err
         err isa JWTError && rethrow()
         throw(JWTClaimError(:malformed_payload, "jwt payload is not valid base64url-encoded JSON"))

@@ -77,6 +77,17 @@ const test_payload_data = [
     }""")
 ]
 
+Base.@kwdef struct VerifierTestClaims
+    iss::Union{Nothing,String} = nothing
+    sub::Union{Nothing,String} = nothing
+    aud::Union{Nothing,String,Vector{String}} = nothing
+    exp::Union{Nothing,Int64} = nothing
+    nbf::Union{Nothing,Int64} = nothing
+    iat::Union{Nothing,Int64} = nothing
+    jti::Union{Nothing,String} = nothing
+    nonce::Union{Nothing,String} = nothing
+end
+
 struct TypedTestClaims
     sub::String
     exp::Int64
@@ -413,12 +424,39 @@ function test_verifier_claims(keyset_url)
 
     verified = verify(verifier, string(jwt))
     @test verified.token isa JWT
-    @test verified.header["typ"] == "JWT"
+    @test verified.header.typ == "JWT"
     @test JWTs.claims(verified) == base_payload
     @test JWTs.kid(verified) == keyid
     @test JWTs.alg(verified) == algorithm
     @test verified.key === keyset.keys[keyid]
     @test verify(verifier, jwt).claims == base_payload
+
+    # An application-declared claims struct: the payload is decoded straight
+    # into it and every validation read is a typed field access.
+    if applicable(JSON.parse, "", VerifierTestClaims)
+        typed_verifier = Verifier(
+            keyset;
+            algorithms=[algorithm],
+            issuer="https://issuer.example",
+            audience="api://default",
+            subject="subject-1",
+            jwtid="token-1",
+            nonce="nonce-1",
+            required_claims=["exp", "nbf", "iat"],
+            now=() -> 1000.0,
+            claims=VerifierTestClaims,
+        )
+        @test JWTs.claimstype(typed_verifier) === VerifierTestClaims
+        typed_verified = verify(typed_verifier, string(jwt))
+        @test typed_verified isa JWTs.VerifiedJWT{VerifierTestClaims}
+        @test typed_verified.claims.sub == "subject-1"
+        @test typed_verified.claims.exp == 1100
+        @test typed_verified.claims.aud == base_payload["aud"] || typed_verified.claims.aud == [base_payload["aud"]]
+        # a missing required claim is still caught through the struct
+        expired_verifier = Verifier(keyset; algorithms=[algorithm], now=() -> 5000.0, claims=VerifierTestClaims)
+        @test_throws JWTs.JWTClaimError verify(expired_verifier, string(jwt))
+        @test JWTs.claimstype(verifier) === Dict{String,Any}
+    end
 
     vector_audience_verifier = Verifier(keyset; algorithms=[algorithm], audience=["mobile-client", "web-client"], now=() -> 1000.0)
     @test verify(vector_audience_verifier, signed(base_payload)).claims == base_payload

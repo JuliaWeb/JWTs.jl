@@ -240,6 +240,7 @@ end
 Base.@kwdef struct JWTHeaderClaims
     alg::Union{Nothing,String} = nothing
     kid::Union{Nothing,String} = nothing
+    typ::Union{Nothing,String} = nothing
 end
 
 function jwt_string_claim(claims::AbstractDict, claim::String)::Union{Nothing,String}
@@ -256,6 +257,19 @@ function jwt_header_string_claim(encoded::String, claim::String)::Union{Nothing,
     claim == "alg" && return header.alg
     claim == "kid" && return header.kid
     return nothing
+end
+
+# Decode a JOSE header into the typed `JWTHeaderClaims`. The typed
+# `JSON.parse` needs JSON.jl 1; older JSON versions read the object
+# dynamically and project the registered members onto the struct.
+function decode_jwt_header_claims(encoded::String)::JWTHeaderClaims
+    applicable(JSON.parse, "", JWTHeaderClaims) && return decodepart(encoded, JWTHeaderClaims)
+    header = decode_jwt_json_object(encoded)
+    return JWTHeaderClaims(
+        alg=jwt_string_claim(header, "alg"),
+        kid=jwt_string_claim(header, "kid"),
+        typ=jwt_string_claim(header, "typ"),
+    )
 end
 
 """
