@@ -760,6 +760,58 @@ end
         @test JWTs.is_http_url("http://issuer.example/keys")
         @test !JWTs.is_http_url("file:///etc/passwd")
 
+        fallback_header = JWTs.decode_jwt_header_claims_untyped(
+            JWTs.base64url_encode(JSON.json(Dict{String,Any}(
+                "alg" => "HS256",
+                "kid" => "fallback-key",
+                "typ" => "JWT",
+                "crit" => ["example"],
+                "b64" => false,
+            ))),
+        )
+        @test fallback_header.alg == "HS256"
+        @test fallback_header.kid == "fallback-key"
+        @test fallback_header.typ == "JWT"
+        @test fallback_header.crit == ["example"]
+        @test fallback_header.b64 === false
+        @test JWTs.jwt_string_array_claim(Dict{String,Any}(), "crit") === nothing
+        @test ismissing(JWTs.jwt_string_array_claim(Dict{String,Any}("crit" => nothing), "crit"))
+        @test_throws ArgumentError JWTs.jwt_string_array_claim(Dict{String,Any}("crit" => "bad"), "crit")
+        @test_throws ArgumentError JWTs.jwt_string_array_claim(Dict{String,Any}("crit" => Any[1]), "crit")
+        @test JWTs.jwt_bool_claim(Dict{String,Any}(), "b64") === nothing
+        @test ismissing(JWTs.jwt_bool_claim(Dict{String,Any}("b64" => nothing), "b64"))
+        @test JWTs.jwt_bool_claim(Dict{String,Any}("b64" => true), "b64")
+        @test_throws ArgumentError JWTs.jwt_bool_claim(Dict{String,Any}("b64" => 1), "b64")
+
+        parsed_keys = Dict{String,Any}(
+            "keys" => Any[Dict{String,Any}("kid" => "parsed-key")],
+        )
+        @test JWTs.fetched_jwks_keys(parsed_keys, "parsed fixture") === parsed_keys["keys"]
+        untyped_keys = JWTs.fetched_jwks_keys_untyped(JSON.json(parsed_keys), "JSON fixture")
+        @test only(untyped_keys)["kid"] == "parsed-key"
+        @test_throws ArgumentError JWTs.fetched_jwks_keys_untyped("[]", "array fixture")
+        @test_throws ArgumentError JWTs.fetched_jwks_keys_untyped("{}", "missing fixture")
+        @test_throws ArgumentError JWTs.fetched_jwks_keys(1, "invalid fixture")
+
+        default_algs = Dict("RSA" => "RS256", "oct" => "HS256")
+        @test JWTs.default_jwk_alg(
+            JWTs.JWKSKey(; kty="EC", crv="P-256"),
+            default_algs,
+        ) == "ES256"
+        @test_throws ArgumentError JWTs.fetch_url("file:///unused"; downloader=:unsupported)
+
+        http_server = JWTs.HTTP.serve!("127.0.0.1", 0; listenany=true) do request
+            request.target == "/keys" && return JWTs.HTTP.Response(200, "jwks-body")
+            return JWTs.HTTP.Response(404, "missing")
+        end
+        try
+            http_base = "http://127.0.0.1:$(JWTs.HTTP.port(http_server))"
+            @test JWTs.fetch_url(http_base * "/keys") == "jwks-body"
+            @test_throws ErrorException JWTs.fetch_url(http_base * "/missing")
+        finally
+            close(http_server)
+        end
+
         # a remote JWKS must not yield a symmetric (forge-able) key
         secret = collect(codeunits("remote-symmetric-secret"))
         sym_doc = Dict("keys" => [Dict("kid" => "sym1", "kty" => "oct", "alg" => "HS256", "k" => JWTs.base64url_encode(secret))])

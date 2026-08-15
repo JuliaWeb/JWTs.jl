@@ -283,11 +283,9 @@ function jwt_header_string_claim(encoded::String, claim::String)::Union{Nothing,
     return nothing
 end
 
-# Decode a JOSE header into the typed `JWTHeaderClaims`. The typed
-# `JSON.parse` needs JSON.jl 1; older JSON versions read the object
-# dynamically and project the registered members onto the struct.
-function decode_jwt_header_claims(encoded::String)::JWTHeaderClaims
-    applicable(JSON.parse, "", JWTHeaderClaims) && return decodepart(encoded, JWTHeaderClaims)
+# Project a dynamically parsed header onto the registered JOSE members. Keep
+# this separate so the pre-JSON-1 compatibility path can be tested on JSON 1.
+function decode_jwt_header_claims_untyped(encoded::String)::JWTHeaderClaims
     header = decode_jwt_json_object(encoded)
     return JWTHeaderClaims(
         alg=jwt_string_claim(header, "alg"),
@@ -296,6 +294,14 @@ function decode_jwt_header_claims(encoded::String)::JWTHeaderClaims
         crit=jwt_string_array_claim(header, "crit"),
         b64=jwt_bool_claim(header, "b64"),
     )
+end
+
+# Decode a JOSE header into the typed `JWTHeaderClaims`. The typed
+# `JSON.parse` needs JSON.jl 1; older JSON versions read the object
+# dynamically and project the registered members onto the struct.
+function decode_jwt_header_claims(encoded::String)::JWTHeaderClaims
+    applicable(JSON.parse, "", JWTHeaderClaims) && return decodepart(encoded, JWTHeaderClaims)
+    return decode_jwt_header_claims_untyped(encoded)
 end
 
 """
@@ -583,6 +589,10 @@ function fetched_jwks_keys(raw, url::String)
         keys === nothing && throw(ArgumentError("JWKS document from $url must contain a \"keys\" array"))
         return keys
     end
+    return fetched_jwks_keys_untyped(json, url)
+end
+
+function fetched_jwks_keys_untyped(json::String, url::String)
     document = JSON.parse(json)
     document isa AbstractDict || throw(ArgumentError("JWKS document from $url must be a JSON object"))
     keys = get(document, "keys", nothing)
