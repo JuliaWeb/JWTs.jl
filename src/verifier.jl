@@ -187,15 +187,18 @@ end
 function claim_audiences(claimset)
     haskey(claimset, "aud") || throw(JWTClaimError(:claim_missing, "jwt missing required claim aud"))
     value = claimset["aud"]
-    value isa AbstractString && return String[String(value)]
-    if value isa AbstractVector
+    # JSON claims are concrete String / Vector{Any}; narrowing to those (not
+    # AbstractString / AbstractVector) keeps the loop statically dispatched.
+    value isa String && return String[value]
+    if value isa Vector
         audiences = String[]
         for aud in value
-            aud isa AbstractString || throw(JWTClaimError(:claim_type, "jwt claim aud entries must be strings"))
-            push!(audiences, String(aud))
+            aud isa String || throw(JWTClaimError(:claim_type, "jwt claim aud entries must be strings"))
+            push!(audiences, aud)
         end
         return audiences
     end
+    value isa AbstractString && return String[String(value)]
     throw(JWTClaimError(:claim_type, "jwt claim aud must be a string or array of strings"))
 end
 

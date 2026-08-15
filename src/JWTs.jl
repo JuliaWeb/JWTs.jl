@@ -503,7 +503,10 @@ end
 
 function refresh!(keyseturl::String, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing, fetcher=nothing, allow_symmetric=nothing)
     raw = fetcher === nothing ? fetch_url(keyseturl; downloader=downloader) : fetcher(keyseturl)
-    keys = jwks_document(raw, keyseturl)["keys"]
+    document = jwks_document(raw, keyseturl)
+    document isa AbstractDict || throw(ArgumentError("JWKS document from $keyseturl must be a JSON object"))
+    keys = get(document, "keys", nothing)
+    keys isa AbstractVector || throw(ArgumentError("JWKS document from $keyseturl must contain a \"keys\" array"))
     allow_symmetric = something(allow_symmetric, !is_http_url(keyseturl))
     refresh!(keys, keysetdict; default_algs=default_algs, allow_symmetric=allow_symmetric)
 end
