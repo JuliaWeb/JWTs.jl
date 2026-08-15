@@ -57,6 +57,7 @@ function normalize_required_claims(required_claims)
 end
 
 function Verifier(
+    ::Type{C},
     keyset::VerifierKeySource;
     algorithms=nothing,
     issuer::Union{Nothing,AbstractString}=nothing,
@@ -68,8 +69,8 @@ function Verifier(
     max_age::Union{Nothing,Real}=nothing,
     required_claims=String[],
     now=time,
-    claims::Type=Dict{String,Any},
-)
+) where {C}
+    isconcretetype(C) || throw(ArgumentError("Verifier claims type must be concrete, got $C"))
     algorithms === nothing && throw(ArgumentError("Verifier requires an explicit algorithms allowlist"))
     algs = String[String(alg) for alg in algorithms]
     isempty(algs) && throw(ArgumentError("Verifier requires a non-empty algorithms allowlist"))
@@ -90,7 +91,37 @@ function Verifier(
         max_age === nothing ? nothing : Float64(max_age),
         normalize_required_claims(required_claims),
         normalize_now_function(now),
+        C,
+    )
+end
+
+function Verifier(
+    keyset::VerifierKeySource;
+    algorithms=nothing,
+    issuer::Union{Nothing,AbstractString}=nothing,
+    audience=nothing,
+    subject::Union{Nothing,AbstractString}=nothing,
+    jwtid::Union{Nothing,AbstractString}=nothing,
+    nonce::Union{Nothing,AbstractString}=nothing,
+    leeway::Real=0,
+    max_age::Union{Nothing,Real}=nothing,
+    required_claims=String[],
+    now=time,
+    claims::Type=Dict{String,Any},
+)
+    return Verifier(
         claims,
+        keyset;
+        algorithms,
+        issuer,
+        audience,
+        subject,
+        jwtid,
+        nonce,
+        leeway,
+        max_age,
+        required_claims,
+        now,
     )
 end
 
@@ -98,10 +129,14 @@ end
 # Explicit forwarding (not `kwargs...` splatting) so the call resolves to
 # the keyset constructor alone: with a splat, inference unions this over
 # every keyword `Verifier` method, and the result type is no longer concrete.
+Verifier(::Type{C}, keys::Vector; algorithms=nothing, issuer=nothing, audience=nothing, subject=nothing, jwtid=nothing, nonce=nothing, leeway::Real=0, max_age=nothing, required_claims=String[], now=time) where {C} =
+    Verifier(C, JWKSet(keys); algorithms, issuer, audience, subject, jwtid, nonce, leeway, max_age, required_claims, now)
+
 Verifier(keys::Vector; algorithms=nothing, issuer=nothing, audience=nothing, subject=nothing, jwtid=nothing, nonce=nothing, leeway::Real=0, max_age=nothing, required_claims=String[], now=time, claims::Type=Dict{String,Any}) =
-    Verifier(JWKSet(keys); algorithms, issuer, audience, subject, jwtid, nonce, leeway, max_age, required_claims, now, claims)
+    Verifier(claims, keys; algorithms, issuer, audience, subject, jwtid, nonce, leeway, max_age, required_claims, now)
 
 function Verifier(
+    ::Type{C},
     issuer_url::AbstractString;
     discovery_path::AbstractString="/.well-known/openid-configuration",
     metadata_ttl::Real=300,
@@ -119,7 +154,7 @@ function Verifier(
     leeway::Real=0,
     max_age::Union{Nothing,Real}=nothing,
     required_claims=String[],
-)
+) where {C}
     issuer_s = String(rstrip(String(issuer_url), '/'))
     source = OIDCDiscovery(
         issuer_s;
@@ -133,6 +168,7 @@ function Verifier(
         now=now,
     )
     return Verifier(
+        C,
         source;
         algorithms=algorithms,
         issuer=issuer_s,
@@ -164,7 +200,90 @@ function Verifier(;
     leeway::Real=0,
     max_age::Union{Nothing,Real}=nothing,
     required_claims=String[],
+    claims::Type=Dict{String,Any},
 )
+    return Verifier(
+        claims;
+        jwks_uri,
+        jwks_ttl,
+        refresh_cooldown,
+        default_algs,
+        fetcher,
+        downloader,
+        now,
+        algorithms,
+        issuer,
+        audience,
+        subject,
+        jwtid,
+        nonce,
+        leeway,
+        max_age,
+        required_claims,
+    )
+end
+
+function Verifier(
+    issuer_url::AbstractString;
+    discovery_path::AbstractString="/.well-known/openid-configuration",
+    metadata_ttl::Real=300,
+    jwks_ttl::Real=300,
+    refresh_cooldown::Real=30,
+    default_algs=DEFAULT_JWK_ALGS,
+    fetcher=nothing,
+    downloader=nothing,
+    now=time,
+    algorithms=nothing,
+    audience=nothing,
+    subject::Union{Nothing,AbstractString}=nothing,
+    jwtid::Union{Nothing,AbstractString}=nothing,
+    nonce::Union{Nothing,AbstractString}=nothing,
+    leeway::Real=0,
+    max_age::Union{Nothing,Real}=nothing,
+    required_claims=String[],
+    claims::Type=Dict{String,Any},
+)
+    return Verifier(
+        claims,
+        issuer_url;
+        discovery_path,
+        metadata_ttl,
+        jwks_ttl,
+        refresh_cooldown,
+        default_algs,
+        fetcher,
+        downloader,
+        now,
+        algorithms,
+        audience,
+        subject,
+        jwtid,
+        nonce,
+        leeway,
+        max_age,
+        required_claims,
+    )
+end
+
+function Verifier(
+    ::Type{C};
+    jwks_uri=nothing,
+    jwks_ttl::Real=300,
+    refresh_cooldown::Real=30,
+    default_algs=DEFAULT_JWK_ALGS,
+    fetcher=nothing,
+    downloader=nothing,
+    now=time,
+    algorithms=nothing,
+    issuer::Union{Nothing,AbstractString}=nothing,
+    audience=nothing,
+    subject::Union{Nothing,AbstractString}=nothing,
+    jwtid::Union{Nothing,AbstractString}=nothing,
+    nonce::Union{Nothing,AbstractString}=nothing,
+    leeway::Real=0,
+    max_age::Union{Nothing,Real}=nothing,
+    required_claims=String[],
+) where {C}
     jwks_uri === nothing && throw(ArgumentError("Verifier requires a JWKSet, key vector, OIDC issuer, or jwks_uri"))
     source = RemoteJWKSet(
         jwks_uri;
@@ -176,6 +295,7 @@ function Verifier(;
         now=now,
     )
     return Verifier(
+        C,
         source;
         algorithms=algorithms,
         issuer=issuer,
@@ -205,8 +325,8 @@ function claim_string(claimset, name::String)
 end
 
 function claim_audiences(claimset)
+    hasclaim(claimset, "aud") || throw(JWTClaimError(:claim_missing, "jwt missing required claim aud"))
     value = claimvalue(claimset, "aud")
-    value === nothing && throw(JWTClaimError(:claim_missing, "jwt missing required claim aud"))
     # JSON claims are concrete String / Vector{Any}; narrowing to those (not
     # AbstractString / AbstractVector) keeps the loop statically dispatched.
     value isa String && return String[value]
@@ -231,12 +351,13 @@ decode_claims(encoded::String, ::Type{Dict{String,Any}}) = decode_jwt_json_objec
 decode_claims(encoded::String, ::Type{C}) where {C} = decodepart(encoded, C)
 
 claimvalue(claims::AbstractDict, name::String) = get(claims, name, nothing)
-function claimvalue(claims::T, name::String) where {T}
-    sym = Symbol(name)
-    return hasfield(T, sym) ? getfield(claims, sym) : nothing
+@generated function claimvalue(claims::T, name::String) where {T}
+    reads = [:(name == $(String(field)) && return getfield(claims, $(QuoteNode(field))))
+             for field in fieldnames(T)]
+    return Expr(:block, reads..., :(return nothing))
 end
 hasclaim(claims::AbstractDict, name::String) = haskey(claims, name)
-hasclaim(claims::T, name::String) where {T} = (sym = Symbol(name); hasfield(T, sym) && getfield(claims, sym) !== nothing)
+hasclaim(claims::T, name::String) where {T} = claimvalue(claims, name) !== nothing
 
 function require_claims!(claimset, required_claims)
     for claim in required_claims
@@ -306,6 +427,14 @@ function verify(verifier::Verifier, jwt::JWT)
     header_alg in verifier.algorithms || throw(JWTVerificationError(:algorithm_disallowed, "jwt algorithm is not allowed"))
     header_kid = header.kid
     header_kid === nothing && throw(JWTVerificationError(:key_id_missing, "jwt header does not include kid"))
+    header.crit === nothing || throw(JWTVerificationError(
+        :critical_header_unsupported,
+        "jwt uses critical JOSE header parameters that this verifier does not support",
+    ))
+    header.b64 === nothing || throw(JWTVerificationError(
+        :critical_header_unsupported,
+        "jwt uses the unsupported JOSE b64 header parameter",
+    ))
     key = resolve_verification_key(verifier.keyset, header_kid)
     valid = validate!(jwt, key; algorithms=verifier.algorithms)
     valid || throw(JWTVerificationError(:signature_invalid, "invalid jwt signature"))

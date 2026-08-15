@@ -1,5 +1,0 @@
-[deps]
-JWTs = "d850fbd6-035d-5a70-a269-1ca2e636ac6c"
-
-[sources]
-JWTs = {rev = "trim-typed-jwks", url = "https://github.com/JuliaWeb/JWTs.jl"}

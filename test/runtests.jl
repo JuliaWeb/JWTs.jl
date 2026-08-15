@@ -443,6 +443,7 @@ function test_verifier_claims(keyset_url)
         typed_payload["aud"] = "api://default"
         typed_jwt = signed(typed_payload)
         typed_verifier = Verifier(
+            VerifierTestClaims,
             keyset;
             algorithms=[algorithm],
             issuer="https://issuer.example",
@@ -452,7 +453,6 @@ function test_verifier_claims(keyset_url)
             nonce="nonce-1",
             required_claims=["exp", "nbf", "iat"],
             now=() -> 1000.0,
-            claims=VerifierTestClaims,
         )
         @test JWTs.claimstype(typed_verifier) === VerifierTestClaims
         typed_verified = verify(typed_verifier, string(typed_jwt))
@@ -468,6 +468,17 @@ function test_verifier_claims(keyset_url)
 
     vector_audience_verifier = Verifier(keyset; algorithms=[algorithm], audience=["mobile-client", "web-client"], now=() -> 1000.0)
     @test verify(vector_audience_verifier, signed(base_payload)).claims == base_payload
+
+    null_audience = copy(base_payload)
+    null_audience["aud"] = nothing
+    null_audience_error = try
+        verify(verifier, signed(null_audience))
+        nothing
+    catch err
+        err
+    end
+    @test null_audience_error isa JWTs.JWTClaimError
+    @test null_audience_error.code === :claim_type
 
     string_audience_payload = copy(base_payload)
     string_audience_payload["aud"] = "api://default"
@@ -570,6 +581,17 @@ function test_remote_jwks_and_oidc()
     @test verify(verifier, string(jwt1)).claims == payload
     @test fetch_counts[jwks_uri] == 1
 
+    typed_remote = Verifier(VerifierTestClaims;
+        jwks_uri=jwks_uri,
+        algorithms=["RS256"],
+        issuer=issuer,
+        audience="api://default",
+        fetcher=_ -> doc1,
+        now=clock,
+    )
+    @test JWTs.claimstype(typed_remote) === VerifierTestClaims
+    @test verify(typed_remote, jwt1).claims.sub == "remote-user"
+
     clock.value += 61
     @test verify(verifier, jwt1).claims == payload
     @test fetch_counts[jwks_uri] == 2
@@ -630,6 +652,18 @@ function test_remote_jwks_and_oidc()
     @test verify(oidc_verifier, jwt2).claims == payload
     @test discovery_counts[discovery_url] == 1
     @test discovery_counts[jwks_uri] == 1
+
+    typed_oidc = Verifier(
+        VerifierTestClaims,
+        issuer;
+        algorithms=["RS256"],
+        audience="api://default",
+        fetcher=url -> url == discovery_url ?
+            Dict("issuer" => issuer, "jwks_uri" => jwks_uri) : doc2,
+        now=clock,
+    )
+    @test JWTs.claimstype(typed_oidc) === VerifierTestClaims
+    @test verify(typed_oidc, jwt2).claims.sub == "remote-user"
     @test verify(oidc_verifier, jwt2).claims == payload
     @test discovery_counts[discovery_url] == 1
     @test discovery_counts[jwks_uri] == 1
@@ -768,5 +802,54 @@ end
         end
         @test missing_iss_err isa JWTs.JWTClaimError
         @test missing_iss_err.code === :claim_missing
+
+        critical_header = JWTs.base64url_encode(JSON.json(Dict{String,Any}(
+            "alg" => "HS256",
+            "kid" => oct_kid,
+            "crit" => ["example"],
+            "example" => true,
+        )))
+        critical_data = critical_header * "." * signed_token.payload
+        critical_signature = JWTs.base64url_encode(
+            JWTs.signbytes(oct_keyset.keys[oct_kid], critical_data),
+        )
+        critical_token = JWT(join((critical_header, signed_token.payload, critical_signature), "."))
+        critical_error = try
+            verify(plain_verifier, critical_token)
+            nothing
+        catch err
+            err
+        end
+        @test critical_error isa JWTs.JWTVerificationError
+        @test critical_error.code === :critical_header_unsupported
+
+        null_critical_header = JWTs.base64url_encode(JSON.json(Dict{String,Any}(
+            "alg" => "HS256",
+            "kid" => oct_kid,
+            "crit" => nothing,
+        )))
+        null_critical_data = null_critical_header * "." * signed_token.payload
+        null_critical_signature = JWTs.base64url_encode(
+            JWTs.signbytes(oct_keyset.keys[oct_kid], null_critical_data),
+        )
+        null_critical_token = JWT(join(
+            (null_critical_header, signed_token.payload, null_critical_signature),
+            ".",
+        ))
+        @test_throws JWTs.JWTVerificationError verify(plain_verifier, null_critical_token)
+
+        b64_header = JWTs.base64url_encode(JSON.json(Dict{String,Any}(
+            "alg" => "HS256",
+            "kid" => oct_kid,
+            "b64" => false,
+        )))
+        b64_data = b64_header * "." * signed_token.payload
+        b64_signature = JWTs.base64url_encode(
+            JWTs.signbytes(oct_keyset.keys[oct_kid], b64_data),
+        )
+        b64_token = JWT(join((b64_header, signed_token.payload, b64_signature), "."))
+        @test_throws JWTs.JWTVerificationError verify(plain_verifier, b64_token)
+
+        @test_throws ArgumentError Verifier(Any, oct_keyset; algorithms=["HS256"])
     end
 end

@@ -27,6 +27,7 @@ if VERSION >= v"1.11"
         :JWKSError,
         :parse_keyfile,
         :claims,
+        :claimstype,
         :kid,
         :alg,
         :issigned,
@@ -241,11 +242,34 @@ Base.@kwdef struct JWTHeaderClaims
     alg::Union{Nothing,String} = nothing
     kid::Union{Nothing,String} = nothing
     typ::Union{Nothing,String} = nothing
+    crit::Union{Nothing,Missing,Vector{String}} = nothing
+    b64::Union{Nothing,Missing,Bool} = nothing
 end
 
 function jwt_string_claim(claims::AbstractDict, claim::String)::Union{Nothing,String}
     value = get(claims, claim, nothing)
     value isa String || return nothing
+    return value
+end
+
+function jwt_string_array_claim(claims::AbstractDict, claim::String)::Union{Nothing,Missing,Vector{String}}
+    haskey(claims, claim) || return nothing
+    value = claims[claim]
+    value === nothing && return missing
+    value isa AbstractVector || throw(ArgumentError("jwt header $claim must be an array of strings"))
+    result = String[]
+    for item in value
+        item isa AbstractString || throw(ArgumentError("jwt header $claim must be an array of strings"))
+        push!(result, String(item))
+    end
+    return result
+end
+
+function jwt_bool_claim(claims::AbstractDict, claim::String)::Union{Nothing,Missing,Bool}
+    haskey(claims, claim) || return nothing
+    value = claims[claim]
+    value === nothing && return missing
+    value isa Bool || throw(ArgumentError("jwt header $claim must be a boolean"))
     return value
 end
 
@@ -269,6 +293,8 @@ function decode_jwt_header_claims(encoded::String)::JWTHeaderClaims
         alg=jwt_string_claim(header, "alg"),
         kid=jwt_string_claim(header, "kid"),
         typ=jwt_string_claim(header, "typ"),
+        crit=jwt_string_array_claim(header, "crit"),
+        b64=jwt_bool_claim(header, "b64"),
     )
 end
 
@@ -564,9 +590,9 @@ function fetched_jwks_keys(raw, url::String)
     return keys
 end
 
-# `downloader` is accepted for backwards compatibility and ignored: remote key
-# sets are fetched with HTTP.jl. Pass a `fetcher` to customize retrieval.
 function fetch_url(url::String; downloader=nothing)
+    downloader === nothing || throw(ArgumentError(
+        "the downloader keyword is not supported by the HTTP.jl fetch path; pass fetcher=url -> ... instead"))
     if startswith(url, "file://")
         return readchomp(url[8:end])
     else
