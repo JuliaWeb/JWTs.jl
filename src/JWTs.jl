@@ -1,7 +1,7 @@
 module JWTs
 
 using JSON
-using Downloads
+using HTTP
 using OpenSSL_jll
 using SHA
 
@@ -486,18 +486,17 @@ function jwks_document(raw, url::String)
     end
 end
 
+# `downloader` is accepted for backwards compatibility and ignored: remote key
+# sets are fetched with HTTP.jl. Pass a `fetcher` to customize retrieval.
 function fetch_url(url::String; downloader=nothing)
     if startswith(url, "file://")
         return readchomp(url[8:end])
     else
-        output = PipeBuffer()
-        response = Downloads.request(url; method="GET", output=output, downloader=downloader)
-        # Downloads.request only throws on transport-level errors, not on HTTP error
-        # status codes, so a 4xx/5xx error page would otherwise be parsed as a keyset.
-        if response isa Downloads.Response && !(200 <= response.status < 300)
+        response = HTTP.get(url; status_exception=false)
+        # A 4xx/5xx error page must not be parsed as a keyset.
+        200 <= response.status < 300 ||
             throw(ErrorException("failed to fetch $url: HTTP status $(response.status)"))
-        end
-        return String(take!(output))
+        return String(response.body)
     end
 end
 
