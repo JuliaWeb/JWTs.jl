@@ -194,6 +194,7 @@ function _run_trim_case(package_project_path::String, juliac_project_path::Strin
             run_path = _trim_output_path(run_dir, output_name)
             @test exit_code == 0
             @test isfile(run_path)
+            exit_code == 0 && isfile(run_path) || return nothing
             run_cmd = `$(abspath(run_path))`
             run_exit, run_output, run_timed_out = _run_trim_executable(run_cmd)
             run_timed_out && _trim_timeout_error("executable run", script_file, run_output)

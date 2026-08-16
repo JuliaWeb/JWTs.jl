@@ -74,6 +74,22 @@ function run_jwt_trim_core()::Nothing
     trim_check_claims(JWTs.claims(parsed, TrimClaims))
     trim_check_signature(parsed, keyset.keys[TRIM_KID])
 
+    verifier = JWTs.Verifier(
+        TrimClaims,
+        keyset;
+        algorithms=["HS256"],
+        issuer=TRIM_ISSUER,
+        audience=TRIM_AUDIENCE,
+        subject=TRIM_SUBJECT,
+        jwtid=TRIM_JWT_ID,
+        nonce=TRIM_NONCE,
+        required_claims=["iat", "nbf", "exp"],
+        now=() -> 1_500.0,
+    )
+    verified = JWTs.verify(verifier, token)
+    JWTs.claimstype(verifier) === TrimClaims || error("typed verifier claim type mismatch")
+    trim_check_claims(JWTs.claims(verified))
+
     imported_keyset = JWTs.JWKSet([trim_oct_jwk()])
     JWTs.validate!(parsed, imported_keyset.keys[TRIM_KID]; algorithms=["HS256"]) ||
         error("key-set validation failed")

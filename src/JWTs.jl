@@ -1,7 +1,7 @@
 module JWTs
 
 using JSON
-using Downloads
+using HTTP
 using OpenSSL_jll
 using SHA
 
@@ -27,6 +27,7 @@ if VERSION >= v"1.11"
         :JWKSError,
         :parse_keyfile,
         :claims,
+        :claimstype,
         :kid,
         :alg,
         :issigned,
@@ -240,11 +241,35 @@ end
 Base.@kwdef struct JWTHeaderClaims
     alg::Union{Nothing,String} = nothing
     kid::Union{Nothing,String} = nothing
+    typ::Union{Nothing,String} = nothing
+    crit::Union{Nothing,Missing,Vector{String}} = nothing
+    b64::Union{Nothing,Missing,Bool} = nothing
 end
 
 function jwt_string_claim(claims::AbstractDict, claim::String)::Union{Nothing,String}
     value = get(claims, claim, nothing)
     value isa String || return nothing
+    return value
+end
+
+function jwt_string_array_claim(claims::AbstractDict, claim::String)::Union{Nothing,Missing,Vector{String}}
+    haskey(claims, claim) || return nothing
+    value = claims[claim]
+    value === nothing && return missing
+    value isa AbstractVector || throw(ArgumentError("jwt header $claim must be an array of strings"))
+    result = String[]
+    for item in value
+        item isa AbstractString || throw(ArgumentError("jwt header $claim must be an array of strings"))
+        push!(result, String(item))
+    end
+    return result
+end
+
+function jwt_bool_claim(claims::AbstractDict, claim::String)::Union{Nothing,Missing,Bool}
+    haskey(claims, claim) || return nothing
+    value = claims[claim]
+    value === nothing && return missing
+    value isa Bool || throw(ArgumentError("jwt header $claim must be a boolean"))
     return value
 end
 
@@ -256,6 +281,27 @@ function jwt_header_string_claim(encoded::String, claim::String)::Union{Nothing,
     claim == "alg" && return header.alg
     claim == "kid" && return header.kid
     return nothing
+end
+
+# Project a dynamically parsed header onto the registered JOSE members. Keep
+# this separate so the pre-JSON-1 compatibility path can be tested on JSON 1.
+function decode_jwt_header_claims_untyped(encoded::String)::JWTHeaderClaims
+    header = decode_jwt_json_object(encoded)
+    return JWTHeaderClaims(
+        alg=jwt_string_claim(header, "alg"),
+        kid=jwt_string_claim(header, "kid"),
+        typ=jwt_string_claim(header, "typ"),
+        crit=jwt_string_array_claim(header, "crit"),
+        b64=jwt_bool_claim(header, "b64"),
+    )
+end
+
+# Decode a JOSE header into the typed `JWTHeaderClaims`. The typed
+# `JSON.parse` needs JSON.jl 1; older JSON versions read the object
+# dynamically and project the registered members onto the struct.
+function decode_jwt_header_claims(encoded::String)::JWTHeaderClaims
+    applicable(JSON.parse, "", JWTHeaderClaims) && return decodepart(encoded, JWTHeaderClaims)
+    return decode_jwt_header_claims_untyped(encoded)
 end
 
 """
@@ -474,61 +520,135 @@ function refresh!(keyset::JWKSet; default_algs = Dict("RSA" => "RS256", "oct" =>
     nothing
 end
 
-function jwks_document(raw, url::String)
+"""
+    JWKSKey
+
+The RFC 7517/7518 JWK members the key-set refresh reads, each an optional
+string. Unknown members (`x5c`, `key_ops`, …) are skipped by the typed parse.
+An entry parsed into this shape is read with concretely typed member accesses
+— a `Dict{String,Any}` element type here would make every member read (and
+the error-display machinery behind `make(::Type{Any})`) dynamic under
+`juliac --trim`.
+"""
+Base.@kwdef struct JWKSKey
+    kid::Union{Nothing,String} = nothing
+    kty::Union{Nothing,String} = nothing
+    alg::Union{Nothing,String} = nothing
+    crv::Union{Nothing,String} = nothing
+    n::Union{Nothing,String} = nothing
+    e::Union{Nothing,String} = nothing
+    k::Union{Nothing,String} = nothing
+    x::Union{Nothing,String} = nothing
+    y::Union{Nothing,String} = nothing
+end
+
+"""
+    JWKSDocument
+
+The RFC 7517 JWK Set document shape: a JSON object with a `keys` array.
+Fetched documents parse into this type rather than an untyped JSON object, so
+the key-set refresh path stays concretely typed — which statically compiled
+(`juliac --trim`) consumers need.
+"""
+Base.@kwdef struct JWKSDocument
+    keys::Union{Nothing,Vector{JWKSKey}} = nothing
+end
+
+# One member of a JWK entry, by its RFC name. Entries arrive either as plain
+# dicts (the public `refresh!(keys::Vector, …)`/`JWKSet(::Vector)` path — the
+# dict reads keep their original KeyError/TypeError behavior) or as the typed
+# `JWKSKey` from a fetched document; call sites pass literal names, so the
+# struct read constant-folds to a field access.
+jwk_member(key::AbstractDict, name::String)::String = key[name]::String
+function jwk_member(key::JWKSKey, name::String)::String
+    value = getfield(key, Symbol(name))
+    value === nothing && throw(KeyError(name))
+    return value
+end
+jwk_optional_member(key::AbstractDict, name::String)::Union{Nothing,String} =
+    haskey(key, name) ? key[name]::String : nothing
+jwk_optional_member(key::JWKSKey, name::String)::Union{Nothing,String} = getfield(key, Symbol(name))
+
+# The `keys` member of a fetched JWKS document, concretely typed. A custom
+# fetcher may hand back an already-parsed object — that arm stays dynamic by
+# design. String and byte documents go through the typed parse on JSON.jl 1,
+# with the untyped read as the pre-1 fallback. (The RemoteJWKSet path has its
+# own `jwks_keys(doc, url)` over pre-parsed documents in remote_jwks.jl.)
+function fetched_jwks_keys(raw, url::String)
     if raw isa AbstractDict
-        return raw
-    elseif raw isa AbstractString
-        return JSON.parse(String(raw))
-    elseif raw isa AbstractVector{UInt8}
-        return JSON.parse(String(raw))
-    else
-        throw(ArgumentError("unsupported JWKS document result from $url: $(typeof(raw))"))
+        keys = get(raw, "keys", nothing)
+        keys isa AbstractVector || throw(ArgumentError("JWKS document from $url must contain a \"keys\" array"))
+        return keys
     end
+    raw isa AbstractString || raw isa AbstractVector{UInt8} ||
+        throw(ArgumentError("unsupported JWKS document result from $url: $(typeof(raw))"))
+    json = String(raw)
+    if applicable(JSON.parse, json, JWKSDocument)
+        document = JSON.parse(json, JWKSDocument)
+        keys = document.keys
+        keys === nothing && throw(ArgumentError("JWKS document from $url must contain a \"keys\" array"))
+        return keys
+    end
+    return fetched_jwks_keys_untyped(json, url)
+end
+
+function fetched_jwks_keys_untyped(json::String, url::String)
+    document = JSON.parse(json)
+    document isa AbstractDict || throw(ArgumentError("JWKS document from $url must be a JSON object"))
+    keys = get(document, "keys", nothing)
+    keys isa AbstractVector || throw(ArgumentError("JWKS document from $url must contain a \"keys\" array"))
+    return keys
 end
 
 function fetch_url(url::String; downloader=nothing)
+    downloader === nothing || throw(ArgumentError(
+        "the downloader keyword is not supported by the HTTP.jl fetch path; pass fetcher=url -> ... instead"))
     if startswith(url, "file://")
         return readchomp(url[8:end])
     else
-        output = PipeBuffer()
-        response = Downloads.request(url; method="GET", output=output, downloader=downloader)
-        # Downloads.request only throws on transport-level errors, not on HTTP error
-        # status codes, so a 4xx/5xx error page would otherwise be parsed as a keyset.
-        if response isa Downloads.Response && !(200 <= response.status < 300)
+        response = HTTP.get(url; status_exception=false)
+        # A 4xx/5xx error page must not be parsed as a keyset.
+        200 <= response.status < 300 ||
             throw(ErrorException("failed to fetch $url: HTTP status $(response.status)"))
-        end
-        return String(take!(output))
+        return String(response.body)
     end
 end
 
 function refresh!(keyseturl::String, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), downloader=nothing, fetcher=nothing, allow_symmetric=nothing)
     raw = fetcher === nothing ? fetch_url(keyseturl; downloader=downloader) : fetcher(keyseturl)
-    keys = jwks_document(raw, keyseturl)["keys"]
+    keys = fetched_jwks_keys(raw, keyseturl)
     allow_symmetric = something(allow_symmetric, !is_http_url(keyseturl))
     refresh!(keys, keysetdict; default_algs=default_algs, allow_symmetric=allow_symmetric)
 end
 
-function default_jwk_alg(key, default_algs)
-    haskey(key, "alg") && return key["alg"]
-    kty = key["kty"]
+# RFC 7517 JWK members are strings; reading them through `jwk_member` (a
+# `::String`-asserted dict lookup, or a typed `JWKSKey` field) keeps every
+# downstream call (JWK construction, base64 decoding, keyset insertion)
+# concretely typed — required for `juliac --trim` — while a malformed member
+# lands in `refresh!`'s existing per-key skip handling.
+function default_jwk_alg(key, default_algs::Dict{String,String})::String
+    alg = jwk_optional_member(key, "alg")
+    alg !== nothing && return alg
+    kty = jwk_member(key, "kty")
     if kty in ("EC", "OKP")
-        return alg_for_curve(key["crv"])
+        return alg_for_curve(jwk_member(key, "crv"))
     else
         return get(default_algs, kty, "none")
     end
 end
 
 function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dict("RSA" => "RS256", "oct" => "HS256"), allow_symmetric::Bool=true)
+    default_algs_str = convert(Dict{String,String}, default_algs)
     for key in keys
-        kid = key["kid"]
-        kty = key["kty"]
-        alg = default_jwk_alg(key, default_algs)
+        kid = jwk_member(key, "kid")
+        kty = jwk_member(key, "kty")
+        alg = default_jwk_alg(key, default_algs_str)
 
         # ref: https://tools.ietf.org/html/rfc7518
         try
             if kty == "RSA"
-                n = base64url_decode(key["n"])
-                e = base64url_decode(key["e"])
+                n = base64url_decode(jwk_member(key, "n"))
+                e = base64url_decode(jwk_member(key, "e"))
                 if alg in RSA_ALGORITHMS
                     keysetdict[kid] = JWKRSA(alg, rsa_public_key(n, e))
                 else
@@ -540,7 +660,7 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                     @warn("symmetric keys are not accepted from this key source, skipping key $kid")
                     continue
                 end
-                k = base64url_decode(key["k"])
+                k = base64url_decode(jwk_member(key, "k"))
                 if alg in HMAC_ALGORITHMS
                     keysetdict[kid] = JWKSymmetric(alg, k)
                 else
@@ -548,9 +668,9 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                     continue
                 end
             elseif kty == "EC"
-                crv = key["crv"]
-                x = base64url_decode(key["x"])
-                y = base64url_decode(key["y"])
+                crv = jwk_member(key, "crv")
+                x = base64url_decode(jwk_member(key, "x"))
+                y = base64url_decode(jwk_member(key, "y"))
                 if alg in EC_ALGORITHMS
                     keysetdict[kid] = JWKEC(alg, ec_public_key(crv, x, y), crv)
                 else
@@ -558,8 +678,8 @@ function refresh!(keys::Vector, keysetdict::Dict{String,JWK}; default_algs = Dic
                     continue
                 end
             elseif kty == "OKP"
-                crv = key["crv"]
-                x = base64url_decode(key["x"])
+                crv = jwk_member(key, "crv")
+                x = base64url_decode(jwk_member(key, "x"))
                 if alg in OKP_ALGORITHMS
                     keysetdict[kid] = JWKOKP(alg, okp_public_key(crv, x), crv)
                 else

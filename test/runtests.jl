@@ -77,6 +77,20 @@ const test_payload_data = [
     }""")
 ]
 
+Base.@kwdef struct VerifierTestClaims
+    iss::Union{Nothing,String} = nothing
+    sub::Union{Nothing,String} = nothing
+    # One concrete arm, matching how issuers write a single audience; a
+    # two-arm String|Vector{String} union also works but is not fully static
+    # under juliac --trim on registered StructUtils.
+    aud::Union{Nothing,String} = nothing
+    exp::Union{Nothing,Int64} = nothing
+    nbf::Union{Nothing,Int64} = nothing
+    iat::Union{Nothing,Int64} = nothing
+    jti::Union{Nothing,String} = nothing
+    nonce::Union{Nothing,String} = nothing
+end
+
 struct TypedTestClaims
     sub::String
     exp::Int64
@@ -413,15 +427,58 @@ function test_verifier_claims(keyset_url)
 
     verified = verify(verifier, string(jwt))
     @test verified.token isa JWT
-    @test verified.header["typ"] == "JWT"
+    @test verified.header.typ == "JWT"
     @test JWTs.claims(verified) == base_payload
     @test JWTs.kid(verified) == keyid
     @test JWTs.alg(verified) == algorithm
     @test verified.key === keyset.keys[keyid]
     @test verify(verifier, jwt).claims == base_payload
 
+    # An application-declared claims struct: the payload is decoded straight
+    # into it and every validation read is a typed field access. The struct
+    # commits to one aud arm (String), so the token it decodes is signed with
+    # the single-audience form.
+    if applicable(JSON.parse, "", VerifierTestClaims)
+        typed_payload = copy(base_payload)
+        typed_payload["aud"] = "api://default"
+        typed_jwt = signed(typed_payload)
+        typed_verifier = Verifier(
+            VerifierTestClaims,
+            keyset;
+            algorithms=[algorithm],
+            issuer="https://issuer.example",
+            audience="api://default",
+            subject="subject-1",
+            jwtid="token-1",
+            nonce="nonce-1",
+            required_claims=["exp", "nbf", "iat"],
+            now=() -> 1000.0,
+        )
+        @test JWTs.claimstype(typed_verifier) === VerifierTestClaims
+        typed_verified = verify(typed_verifier, string(typed_jwt))
+        @test typed_verified isa JWTs.VerifiedJWT{VerifierTestClaims}
+        @test typed_verified.claims.sub == "subject-1"
+        @test typed_verified.claims.exp == 1100
+        @test typed_verified.claims.aud == "api://default"
+        # a missing required claim is still caught through the struct
+        expired_verifier = Verifier(keyset; algorithms=[algorithm], now=() -> 5000.0, claims=VerifierTestClaims)
+        @test_throws JWTs.JWTClaimError verify(expired_verifier, string(typed_jwt))
+        @test JWTs.claimstype(verifier) === Dict{String,Any}
+    end
+
     vector_audience_verifier = Verifier(keyset; algorithms=[algorithm], audience=["mobile-client", "web-client"], now=() -> 1000.0)
     @test verify(vector_audience_verifier, signed(base_payload)).claims == base_payload
+
+    null_audience = copy(base_payload)
+    null_audience["aud"] = nothing
+    null_audience_error = try
+        verify(verifier, signed(null_audience))
+        nothing
+    catch err
+        err
+    end
+    @test null_audience_error isa JWTs.JWTClaimError
+    @test null_audience_error.code === :claim_type
 
     string_audience_payload = copy(base_payload)
     string_audience_payload["aud"] = "api://default"
@@ -524,6 +581,17 @@ function test_remote_jwks_and_oidc()
     @test verify(verifier, string(jwt1)).claims == payload
     @test fetch_counts[jwks_uri] == 1
 
+    typed_remote = Verifier(VerifierTestClaims;
+        jwks_uri=jwks_uri,
+        algorithms=["RS256"],
+        issuer=issuer,
+        audience="api://default",
+        fetcher=_ -> doc1,
+        now=clock,
+    )
+    @test JWTs.claimstype(typed_remote) === VerifierTestClaims
+    @test verify(typed_remote, jwt1).claims.sub == "remote-user"
+
     clock.value += 61
     @test verify(verifier, jwt1).claims == payload
     @test fetch_counts[jwks_uri] == 2
@@ -584,6 +652,18 @@ function test_remote_jwks_and_oidc()
     @test verify(oidc_verifier, jwt2).claims == payload
     @test discovery_counts[discovery_url] == 1
     @test discovery_counts[jwks_uri] == 1
+
+    typed_oidc = Verifier(
+        VerifierTestClaims,
+        issuer;
+        algorithms=["RS256"],
+        audience="api://default",
+        fetcher=url -> url == discovery_url ?
+            Dict("issuer" => issuer, "jwks_uri" => jwks_uri) : doc2,
+        now=clock,
+    )
+    @test JWTs.claimstype(typed_oidc) === VerifierTestClaims
+    @test verify(typed_oidc, jwt2).claims.sub == "remote-user"
     @test verify(oidc_verifier, jwt2).claims == payload
     @test discovery_counts[discovery_url] == 1
     @test discovery_counts[jwks_uri] == 1
@@ -680,6 +760,58 @@ end
         @test JWTs.is_http_url("http://issuer.example/keys")
         @test !JWTs.is_http_url("file:///etc/passwd")
 
+        fallback_header = JWTs.decode_jwt_header_claims_untyped(
+            JWTs.base64url_encode(JSON.json(Dict{String,Any}(
+                "alg" => "HS256",
+                "kid" => "fallback-key",
+                "typ" => "JWT",
+                "crit" => ["example"],
+                "b64" => false,
+            ))),
+        )
+        @test fallback_header.alg == "HS256"
+        @test fallback_header.kid == "fallback-key"
+        @test fallback_header.typ == "JWT"
+        @test fallback_header.crit == ["example"]
+        @test fallback_header.b64 === false
+        @test JWTs.jwt_string_array_claim(Dict{String,Any}(), "crit") === nothing
+        @test ismissing(JWTs.jwt_string_array_claim(Dict{String,Any}("crit" => nothing), "crit"))
+        @test_throws ArgumentError JWTs.jwt_string_array_claim(Dict{String,Any}("crit" => "bad"), "crit")
+        @test_throws ArgumentError JWTs.jwt_string_array_claim(Dict{String,Any}("crit" => Any[1]), "crit")
+        @test JWTs.jwt_bool_claim(Dict{String,Any}(), "b64") === nothing
+        @test ismissing(JWTs.jwt_bool_claim(Dict{String,Any}("b64" => nothing), "b64"))
+        @test JWTs.jwt_bool_claim(Dict{String,Any}("b64" => true), "b64")
+        @test_throws ArgumentError JWTs.jwt_bool_claim(Dict{String,Any}("b64" => 1), "b64")
+
+        parsed_keys = Dict{String,Any}(
+            "keys" => Any[Dict{String,Any}("kid" => "parsed-key")],
+        )
+        @test JWTs.fetched_jwks_keys(parsed_keys, "parsed fixture") === parsed_keys["keys"]
+        untyped_keys = JWTs.fetched_jwks_keys_untyped(JSON.json(parsed_keys), "JSON fixture")
+        @test only(untyped_keys)["kid"] == "parsed-key"
+        @test_throws ArgumentError JWTs.fetched_jwks_keys_untyped("[]", "array fixture")
+        @test_throws ArgumentError JWTs.fetched_jwks_keys_untyped("{}", "missing fixture")
+        @test_throws ArgumentError JWTs.fetched_jwks_keys(1, "invalid fixture")
+
+        default_algs = Dict("RSA" => "RS256", "oct" => "HS256")
+        @test JWTs.default_jwk_alg(
+            JWTs.JWKSKey(; kty="EC", crv="P-256"),
+            default_algs,
+        ) == "ES256"
+        @test_throws ArgumentError JWTs.fetch_url("file:///unused"; downloader=:unsupported)
+
+        http_server = JWTs.HTTP.serve!("127.0.0.1", 0; listenany=true) do request
+            request.target == "/keys" && return JWTs.HTTP.Response(200, "jwks-body")
+            return JWTs.HTTP.Response(404, "missing")
+        end
+        try
+            http_base = "http://127.0.0.1:$(JWTs.HTTP.port(http_server))"
+            @test JWTs.fetch_url(http_base * "/keys") == "jwks-body"
+            @test_throws ErrorException JWTs.fetch_url(http_base * "/missing")
+        finally
+            close(http_server)
+        end
+
         # a remote JWKS must not yield a symmetric (forge-able) key
         secret = collect(codeunits("remote-symmetric-secret"))
         sym_doc = Dict("keys" => [Dict("kid" => "sym1", "kty" => "oct", "alg" => "HS256", "k" => JWTs.base64url_encode(secret))])
@@ -722,5 +854,54 @@ end
         end
         @test missing_iss_err isa JWTs.JWTClaimError
         @test missing_iss_err.code === :claim_missing
+
+        critical_header = JWTs.base64url_encode(JSON.json(Dict{String,Any}(
+            "alg" => "HS256",
+            "kid" => oct_kid,
+            "crit" => ["example"],
+            "example" => true,
+        )))
+        critical_data = critical_header * "." * signed_token.payload
+        critical_signature = JWTs.base64url_encode(
+            JWTs.signbytes(oct_keyset.keys[oct_kid], critical_data),
+        )
+        critical_token = JWT(join((critical_header, signed_token.payload, critical_signature), "."))
+        critical_error = try
+            verify(plain_verifier, critical_token)
+            nothing
+        catch err
+            err
+        end
+        @test critical_error isa JWTs.JWTVerificationError
+        @test critical_error.code === :critical_header_unsupported
+
+        null_critical_header = JWTs.base64url_encode(JSON.json(Dict{String,Any}(
+            "alg" => "HS256",
+            "kid" => oct_kid,
+            "crit" => nothing,
+        )))
+        null_critical_data = null_critical_header * "." * signed_token.payload
+        null_critical_signature = JWTs.base64url_encode(
+            JWTs.signbytes(oct_keyset.keys[oct_kid], null_critical_data),
+        )
+        null_critical_token = JWT(join(
+            (null_critical_header, signed_token.payload, null_critical_signature),
+            ".",
+        ))
+        @test_throws JWTs.JWTVerificationError verify(plain_verifier, null_critical_token)
+
+        b64_header = JWTs.base64url_encode(JSON.json(Dict{String,Any}(
+            "alg" => "HS256",
+            "kid" => oct_kid,
+            "b64" => false,
+        )))
+        b64_data = b64_header * "." * signed_token.payload
+        b64_signature = JWTs.base64url_encode(
+            JWTs.signbytes(oct_keyset.keys[oct_kid], b64_data),
+        )
+        b64_token = JWT(join((b64_header, signed_token.payload, b64_signature), "."))
+        @test_throws JWTs.JWTVerificationError verify(plain_verifier, b64_token)
+
+        @test_throws ArgumentError Verifier(Any, oct_keyset; algorithms=["HS256"])
     end
 end

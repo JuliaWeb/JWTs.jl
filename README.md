@@ -119,10 +119,16 @@ Supported verifier options include:
 - `max_age`: maximum token age from `iat`
 - `required_claims`: claims that must be present
 - `now`: injectable clock, useful for deterministic tests
+- `claims`: a concrete payload type for typed decoding and static compilation
+
+In a trim-compiled entrypoint, put the claim type first so normal Julia dispatch
+keeps it concrete: `JWTs.Verifier(MyClaims, keyset; algorithms=["RS256"])`.
+Normal Julia code can also use the `claims=MyClaims` keyword. Typed decoding
+requires JSON.jl 1.
 
 `aud` may be either a string or an array of strings, matching RFC 7519.
 
-`JWTs.VerifiedJWT` exposes the original parsed token as `verified.token`, the decoded header as `verified.header`, the decoded claims as `verified.claims`, and the matched verification key as `verified.key`. The convenience accessors `JWTs.claims(verified)`, `JWTs.kid(verified)`, and `JWTs.alg(verified)` are also available.
+`JWTs.VerifiedJWT` exposes the original parsed token as `verified.token`, the typed `JWTHeaderClaims` header as `verified.header`, the decoded claims as `verified.claims`, and the matched verification key as `verified.key`. The convenience accessors `JWTs.claims(verified)`, `JWTs.kid(verified)`, and `JWTs.alg(verified)` are also available. A verifier rejects JOSE `crit` and `b64` extension headers because this package does not implement extension-header processing.
 
 ## Remote JWKS
 
@@ -150,7 +156,7 @@ fetcher = url -> read("fixtures/jwks.json", String)
 verifier = JWTs.Verifier(; jwks_uri="https://issuer.example/keys", algorithms=["RS256"], fetcher=fetcher)
 ```
 
-The default fetcher uses Downloads.jl. Pass `downloader=Downloads.Downloader()` when you want to reuse a configured Downloads downloader, or pass `fetcher=url -> ...` when tests or applications need full control over network access. The same keywords are available on `JWTs.refresh!(keyset)` for direct `JWKSet` refreshes.
+The default fetcher uses HTTP.jl. Pass `fetcher=url -> ...` when tests or applications need custom transport, authentication, or fixture behavior. The old `downloader` keyword is still accepted so old calls fail with a clear migration error instead of a method error. The same keywords are available on `JWTs.refresh!(keyset)` for direct `JWKSet` refreshes.
 
 ## OpenID Connect Discovery
 
