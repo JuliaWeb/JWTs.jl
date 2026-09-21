@@ -148,7 +148,7 @@ function fetch_json_document(fetcher, url::String)
         end
     elseif raw isa AbstractVector{UInt8}
         try
-            return JSON.parse(String(raw))
+            return JSON.parse(String(copy(raw)))
         catch
             throw(JWKSError(:parse_failed, "failed to parse JSON document from $url"))
         end

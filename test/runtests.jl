@@ -556,6 +556,40 @@ function test_remote_jwks_and_oidc()
         "iat" => 900,
     )
 
+    @testset "fetcher byte buffers remain reusable" begin
+        for wrap in (identity, x -> @view(x[:]), x -> codeunits(String(x)))
+            raw = wrap(collect(codeunits(JSON.json(doc1))))
+            expected = collect(raw)
+            keyset = JWKSet(jwks_uri)
+            remote = JWTs.RemoteJWKSet(jwks_uri; fetcher=_ -> raw)
+            for _ in 1:2
+                refresh!(keyset; fetcher=_ -> raw)
+                @test haskey(keyset.keys, "rsakey1")
+                @test raw == expected
+                refresh!(remote)
+                @test haskey(remote.keyset.keys, "rsakey1")
+                @test raw == expected
+            end
+        end
+        metadata = collect(codeunits(JSON.json(Dict("issuer" => issuer, "jwks_uri" => jwks_uri))))
+        jwks = collect(codeunits(JSON.json(doc1)))
+        metadata_copy, jwks_copy = copy(metadata), copy(jwks)
+        source = Verifier(issuer; algorithms=["RS256"], metadata_ttl=0, jwks_ttl=0,
+            fetcher=url -> endswith(url, "/keys") ? jwks : metadata, now=clock)
+        token = signed_with_key(signingkeyset, "rsakey1", "rsakey1", payload)
+        for _ in 1:2
+            @test verify(source, token).kid == "rsakey1"
+            @test metadata == metadata_copy
+            @test jwks == jwks_copy
+        end
+        malformed = collect(codeunits("{bad json"))
+        original = copy(malformed)
+        @test_throws JWTs.JWKSError JWTs.fetch_json_document(_ -> malformed, jwks_uri)
+        @test malformed == original
+        @test_throws Exception JWTs.fetched_jwks_keys(malformed, jwks_uri)
+        @test malformed == original
+    end
+
     current_jwks = Ref{Any}(doc1)
     fetch_counts = Dict{String,Int}()
     fetcher = function(url)
@@ -590,7 +624,11 @@ function test_remote_jwks_and_oidc()
         now=clock,
     )
     @test JWTs.claimstype(typed_remote) === VerifierTestClaims
-    @test verify(typed_remote, jwt1).claims.sub == "remote-user"
+    if applicable(JSON.parse, "", VerifierTestClaims)
+        @test verify(typed_remote, jwt1).claims.sub == "remote-user"
+    else
+        @test_throws JWTs.JWTClaimError verify(typed_remote, jwt1)
+    end
 
     clock.value += 61
     @test verify(verifier, jwt1).claims == payload
@@ -663,7 +701,11 @@ function test_remote_jwks_and_oidc()
         now=clock,
     )
     @test JWTs.claimstype(typed_oidc) === VerifierTestClaims
-    @test verify(typed_oidc, jwt2).claims.sub == "remote-user"
+    if applicable(JSON.parse, "", VerifierTestClaims)
+        @test verify(typed_oidc, jwt2).claims.sub == "remote-user"
+    else
+        @test_throws JWTs.JWTClaimError verify(typed_oidc, jwt2)
+    end
     @test verify(oidc_verifier, jwt2).claims == payload
     @test discovery_counts[discovery_url] == 1
     @test discovery_counts[jwks_uri] == 1
