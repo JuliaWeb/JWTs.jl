@@ -46,6 +46,11 @@ end
     # Positive, absent-claim, and fail-closed required-claim controls.
     @test outcome(OptionalTimes,Dict("exp"=>1001,"nbf"=>1000,"iat"=>1000)) == :accepted
     @test outcome(OptionalTimes,Dict{String,Any}()) == :accepted
+    for C in (Dict{String,Any},OptionalTimes)
+        @test outcome(C,Dict{String,Any}();max_age=60) == :claim_missing
+    end
+    @test outcome(SubjectOnly,Dict{String,Any}()) == :malformed_payload
+    @test outcome(SubjectOnly,Dict{String,Any}("sub"=>nothing)) == :malformed_payload
     @test outcome(OptionalTimes,Dict{String,Any}();required_claims=["exp"]) == :claim_missing
     @test outcome(SubjectOnly,Dict("sub"=>"local-user");required_claims=["exp"]) == :claim_missing
     for C in (Dict{String,Any},DefaultClaims)
