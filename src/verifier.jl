@@ -5,9 +5,9 @@ const VerifierKeySource = Union{JWKSet,RemoteJWKSet,OIDCDiscovery}
 # (and `now()` stays a direct call) — required for juliac --trim consumers.
 # `C` is the type the payload is decoded into: `Dict{String,Any}` by default
 # (an open claim set, read dynamically), or an application-declared claims
-# struct passed as `Verifier(...; claims=MyClaims)`, decoded with
-# `JSON.parse(payload, MyClaims)` so every claim read is a typed field access
-# — the shape a statically compiled (`juliac --trim`) verifier needs.
+# struct passed as `Verifier(...; claims=MyClaims)`. Validation checks the
+# original JSON claims before projection; the result keeps the application's
+# concrete type for statically compiled (`juliac --trim`) consumers.
 struct Verifier{S<:VerifierKeySource, F, C}
     keyset::S
     algorithms::Vector{String}
@@ -312,15 +312,15 @@ end
 
 function claim_number(claimset, name::String)
     value = claimvalue(claimset, name)
-    value isa Bool && throw(JWTClaimError(:claim_type, "jwt claim $name must be numeric"))
-    value isa Real && return Float64(value)
+    # These are JSON's decoded numeric types; Bool is not a NumericDate.
+    value isa Union{Int,Int64,Float64,BigInt,BigFloat} && return Float64(value)
     throw(JWTClaimError(:claim_type, "jwt claim $name must be numeric"))
 end
 
 function claim_string(claimset, name::String)
     hasclaim(claimset, name) || throw(JWTClaimError(:claim_missing, "jwt missing required claim $name"))
     value = claimvalue(claimset, name)
-    value isa AbstractString && return String(value)
+    value isa String && return value
     throw(JWTClaimError(:claim_type, "jwt claim $name must be a string"))
 end
 
@@ -330,7 +330,7 @@ function claim_audiences(claimset)
     # JSON claims are concrete String / Vector{Any}; narrowing to those (not
     # AbstractString / AbstractVector) keeps the loop statically dispatched.
     value isa String && return String[value]
-    if value isa Vector
+    if value isa Vector{Any}
         audiences = String[]
         for aud in value
             aud isa String || throw(JWTClaimError(:claim_type, "jwt claim aud entries must be strings"))
@@ -338,14 +338,9 @@ function claim_audiences(claimset)
         end
         return audiences
     end
-    value isa AbstractString && return String[String(value)]
     throw(JWTClaimError(:claim_type, "jwt claim aud must be a string or array of strings"))
 end
 
-# Read one claim from a decoded claim set: a dict lookup, or the field of an
-# application-declared claims struct (`nothing` when absent / no such field).
-# Everything below reads claims only through this seam and `hasclaim`, so a
-# typed claim set flows through validation with concrete field types.
 # Decode a payload into the verifier's claims type.
 decode_claims(encoded::String, ::Type{Dict{String,Any}}) = decode_jwt_json_object(encoded)
 decode_claims(encoded::String, ::Type{C}) where {C} = decodepart(encoded, C)
@@ -438,12 +433,31 @@ function verify(verifier::Verifier, jwt::JWT)
     key = resolve_verification_key(verifier.keyset, header_kid)
     valid = validate!(jwt, key; algorithms=verifier.algorithms)
     valid || throw(JWTVerificationError(:signature_invalid, "invalid jwt signature"))
-    claimset = try
-        decode_claims(jwt.payload, claimstype(verifier))
+    wire_claims = try
+        if claimstype(verifier) === JWTJSONDict
+            decode_jwt_json_object(jwt.payload)
+        else
+            json = JSON.lazy(String(base64url_decode(jwt.payload)))
+            JSON.StructUtils.structlike(JSON.StructUtils.DefaultStyle(), json) ||
+                throw(ArgumentError("JWT payload must be a JSON object"))
+            JSON.parse(json, JWTJSONDict)
+        end
     catch err
         err isa JWTError && rethrow()
         throw(JWTClaimError(:malformed_payload, "jwt payload is not valid base64url-encoded JSON"))
     end
-    validate_claims!(claimset, verifier, verifier.now())
+    # Validate the signed values before projection can omit fields, supply
+    # defaults, or convert JSON booleans into numeric claim fields.
+    validate_claims!(wire_claims, verifier, verifier.now())
+    claimset = if claimstype(verifier) === JWTJSONDict
+        wire_claims
+    else
+        try
+            decode_claims(jwt.payload, claimstype(verifier))
+        catch err
+            err isa JWTError && rethrow()
+            throw(JWTClaimError(:malformed_payload, "jwt payload is not valid base64url-encoded JSON"))
+        end
+    end
     return VerifiedJWT(jwt, header, claimset, header_kid, header_alg, key)
 end
