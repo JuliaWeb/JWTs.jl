@@ -19,6 +19,10 @@ struct TrimClaims
     exp::Int64
 end
 
+struct TrimProjectedClaims
+    sub::String
+end
+
 trim_secret()::Vector{UInt8} = collect(codeunits("trim-compile-secret-material"))
 
 function trim_oct_jwk()
@@ -89,6 +93,22 @@ function run_jwt_trim_core()::Nothing
     verified = JWTs.verify(verifier, token)
     JWTs.claimstype(verifier) === TrimClaims || error("typed verifier claim type mismatch")
     trim_check_claims(JWTs.claims(verified))
+
+    # A result type that omits exp must still reject an expired signed token.
+    expired_payload = trim_payload()
+    expired_payload["exp"] = 1_000
+    expired = JWTs.JWT(; payload=expired_payload)
+    JWTs.sign!(expired, keyset.keys[TRIM_KID], TRIM_KID)
+    projected_verifier = JWTs.Verifier(
+        TrimProjectedClaims, keyset; algorithms=["HS256"], now=() -> 1_500.0,
+    )
+    rejected = try
+        JWTs.verify(projected_verifier, expired)
+        false
+    catch err
+        err isa JWTs.JWTClaimError && err.code === :token_expired
+    end
+    rejected || error("typed projection skipped expiration validation")
 
     imported_keyset = JWTs.JWKSet([trim_oct_jwk()])
     JWTs.validate!(parsed, imported_keyset.keys[TRIM_KID]; algorithms=["HS256"]) ||

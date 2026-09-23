@@ -126,6 +126,11 @@ keeps it concrete: `JWTs.Verifier(MyClaims, keyset; algorithms=["RS256"])`.
 Normal Julia code can also use the `claims=MyClaims` keyword. Typed decoding
 requires JSON.jl 1.
 
+Claim checks use the original signed JSON values before decoding into
+`MyClaims`. Omitting a field from that type does not skip its validation, and
+field defaults do not satisfy `required_claims`. Typed results require an
+additional decoding pass after validation.
+
 `aud` may be either a string or an array of strings, matching RFC 7519.
 
 `JWTs.VerifiedJWT` exposes the original parsed token as `verified.token`, the typed `JWTHeaderClaims` header as `verified.header`, the decoded claims as `verified.claims`, and the matched verification key as `verified.key`. The convenience accessors `JWTs.claims(verified)`, `JWTs.kid(verified)`, and `JWTs.alg(verified)` are also available. A verifier rejects JOSE `crit` and `b64` extension headers because this package does not implement extension-header processing.

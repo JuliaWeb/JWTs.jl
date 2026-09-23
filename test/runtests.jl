@@ -107,6 +107,10 @@ end
     end
 end
 
+if applicable(JSON.parse, "", TypedTestClaims)
+    include("typed_claim_validation_tests.jl")
+end
+
 function print_header(msg)
     println("")
     println("-"^60)
