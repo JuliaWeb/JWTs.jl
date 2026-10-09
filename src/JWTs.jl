@@ -582,7 +582,7 @@ function fetched_jwks_keys(raw, url::String)
     end
     raw isa AbstractString || raw isa AbstractVector{UInt8} ||
         throw(ArgumentError("unsupported JWKS document result from $url: $(typeof(raw))"))
-    json = String(raw)
+    json = raw isa AbstractString ? String(raw) : String(copy(raw))
     if applicable(JSON.parse, json, JWKSDocument)
         document = JSON.parse(json, JWKSDocument)
         keys = document.keys
